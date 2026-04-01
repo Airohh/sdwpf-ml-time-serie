@@ -1,0 +1,40 @@
+.env
+.env.local
+.pytest_cache/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
+*.swo
+
+# Coverage / outils
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Données lourdes / téléchargées
+data/usa/nlr_wtk/
+data/china/sdwpf/
+
+# MLflow local tracking
+mlruns/
+
+# Rapports benchmark CSV/MD (optionnel) ; PNG visibles dans l’IDE
+reports/*
+!reports/.gitkeep
+!reports/figures/
+reports/figures/*
+!reports/figures/.gitkeep
+!reports/figures/*.png
