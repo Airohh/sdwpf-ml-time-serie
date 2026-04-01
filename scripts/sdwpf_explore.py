@@ -11,11 +11,12 @@ Uses package ``sdwpf`` under ``src/``. Run from repo root:
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
 
-_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_ROOT / "src"))
+from sdwpf_paths import prepend_src, repo_root_from_here
+
+_ROOT = repo_root_from_here(__file__)
+prepend_src(_ROOT)
 
 from sdwpf import (
     DEFAULT_METEO_MAX_LAG,
@@ -24,10 +25,16 @@ from sdwpf import (
     load_frame_for_run,
     maybe_log_mlflow,
     project_root,
-    resolve_horizon_steps,
     train_and_evaluate,
 )
-from sdwpf.pipeline import resolve_xgb_device_spec
+from sdwpf.cli_common import (
+    add_xgb_device_argument,
+    apply_meteo_mode_explore_style,
+    resolve_horizon_steps_or_exit,
+    resolve_xgb_device_or_exit,
+    validate_meteo_max_lag,
+    validate_temporal_fractions,
+)
 
 
 def main() -> None:
@@ -99,39 +106,20 @@ def main() -> None:
     p.add_argument("--mlflow", action="store_true")
     p.add_argument("--mlflow-experiment", type=str, default="sdwpf")
     p.add_argument("--mlflow-run-name", type=str, default="")
-    p.add_argument(
-        "--xgb-device",
-        type=str,
-        default=None,
-        metavar="SPEC",
-        help="auto | cpu | cuda | cuda:N ; si omis → SDWPF_XGB_DEVICE ou auto.",
-    )
+    add_xgb_device_argument(p)
     args = p.parse_args()
-    try:
-        xgb_dev = resolve_xgb_device_spec(args.xgb_device)
-    except ValueError as e:
-        raise SystemExit(str(e)) from e
+    xgb_dev = resolve_xgb_device_or_exit(args.xgb_device)
 
-    if args.meteo_mode:
-        args.era5 = True
-        args.no_patv_now = True
-        args.no_patv_lags = True
-    if args.meteo_max_lag < 0:
-        raise SystemExit("--meteo-max-lag must be >= 0")
+    apply_meteo_mode_explore_style(args)
+    validate_meteo_max_lag(args.meteo_max_lag)
 
-    if args.val_frac is not None and args.val_frac <= 0:
-        raise SystemExit("--val-frac must be positive when set")
-    if args.val_frac is not None and args.train_frac + args.val_frac >= 1:
-        raise SystemExit("--train-frac + --val-frac must be < 1")
+    validate_temporal_fractions(args.train_frac, args.val_frac)
 
-    try:
-        horizon_steps = resolve_horizon_steps(
-            args.horizon,
-            args.horizon_hours,
-            args.horizon_days,
-        )
-    except ValueError as e:
-        raise SystemExit(str(e)) from e
+    horizon_steps = resolve_horizon_steps_or_exit(
+        args.horizon,
+        args.horizon_hours,
+        args.horizon_days,
+    )
 
     csv_path = args.csv or default_scada_csv_path()
     if not csv_path.is_file():

@@ -12,11 +12,12 @@ Usage (racine du dépôt) :
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
 
-_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_ROOT / "src"))
+from sdwpf_paths import prepend_src, repo_root_from_here
+
+_ROOT = repo_root_from_here(__file__)
+prepend_src(_ROOT)
 
 import numpy as np
 
@@ -27,10 +28,16 @@ from sdwpf import (
     default_weather_csv_path,
     evaluate_on_indices,
     load_frame_for_run,
-    resolve_horizon_steps,
     walk_forward_indices,
 )
-from sdwpf.pipeline import _patv_feature_description, resolve_xgb_device_spec
+from sdwpf.cli_common import (
+    add_xgb_device_argument,
+    meteo_flags_benchmark_style,
+    resolve_horizon_steps_or_exit,
+    resolve_xgb_device_or_exit,
+    validate_meteo_max_lag,
+)
+from sdwpf.pipeline import _patv_feature_description
 
 
 def main() -> None:
@@ -69,18 +76,9 @@ def main() -> None:
     )
     p.add_argument("--era5", action="store_true")
     p.add_argument("--weather-csv", type=Path, default=None)
-    p.add_argument(
-        "--xgb-device",
-        type=str,
-        default=None,
-        metavar="SPEC",
-        help="auto | cpu | cuda | cuda:N ; si omis → SDWPF_XGB_DEVICE ou auto.",
-    )
+    add_xgb_device_argument(p)
     args = p.parse_args()
-    try:
-        xgb_dev = resolve_xgb_device_spec(args.xgb_device)
-    except ValueError as e:
-        raise SystemExit(str(e)) from e
+    xgb_dev = resolve_xgb_device_or_exit(args.xgb_device)
 
     if args.n_splits < 1 or args.test_size < 1:
         raise SystemExit("--n-splits and --test-size must be >= 1")
@@ -88,17 +86,13 @@ def main() -> None:
         args.val_frac_within_train <= 0 or args.val_frac_within_train >= 1
     ):
         raise SystemExit("--val-frac-within-train must be in (0, 1) when set")
-    if args.meteo_max_lag < 0:
-        raise SystemExit("--meteo-max-lag must be >= 0")
+    validate_meteo_max_lag(args.meteo_max_lag)
 
-    era5 = args.era5 or args.meteo_mode
-    no_patv_now = args.meteo_mode
-    no_patv_lags = args.meteo_mode
+    era5, no_patv_now, no_patv_lags = meteo_flags_benchmark_style(args)
 
-    try:
-        h = resolve_horizon_steps(args.horizon, args.horizon_hours, args.horizon_days)
-    except ValueError as e:
-        raise SystemExit(str(e)) from e
+    h = resolve_horizon_steps_or_exit(
+        args.horizon, args.horizon_hours, args.horizon_days
+    )
 
     csv_path = args.csv or default_scada_csv_path()
     if not csv_path.is_file():

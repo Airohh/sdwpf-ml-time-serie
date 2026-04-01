@@ -11,12 +11,13 @@ Usage (repo root):
 from __future__ import annotations
 
 import argparse
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_ROOT / "src"))
+from sdwpf_paths import prepend_src, repo_root_from_here
+
+_ROOT = repo_root_from_here(__file__)
+prepend_src(_ROOT)
 
 import pandas as pd
 
@@ -28,7 +29,13 @@ from sdwpf import (
     project_root,
     train_and_evaluate,
 )
-from sdwpf.pipeline import resolve_xgb_device_spec
+from sdwpf.cli_common import (
+    add_xgb_device_argument,
+    meteo_flags_benchmark_style,
+    resolve_xgb_device_or_exit,
+    validate_meteo_max_lag,
+    validate_temporal_fractions,
+)
 
 
 def _label_hours(steps: int) -> str:
@@ -77,13 +84,7 @@ def main() -> None:
         help="Avec --meteo-mode : retards ERA5 1..k.",
     )
     p.add_argument("--weather-csv", type=Path, default=None)
-    p.add_argument(
-        "--xgb-device",
-        type=str,
-        default=None,
-        metavar="SPEC",
-        help="auto | cpu | cuda | cuda:N ; si omis → SDWPF_XGB_DEVICE ou auto.",
-    )
+    add_xgb_device_argument(p)
     p.add_argument(
         "--out-dir",
         type=Path,
@@ -91,19 +92,11 @@ def main() -> None:
         help="Default: reports/ under repo root",
     )
     args = p.parse_args()
-    try:
-        xgb_dev = resolve_xgb_device_spec(args.xgb_device)
-    except ValueError as e:
-        raise SystemExit(str(e)) from e
+    xgb_dev = resolve_xgb_device_or_exit(args.xgb_device)
 
-    if args.val_frac is not None and args.val_frac <= 0:
-        raise SystemExit("--val-frac must be positive when set")
-    if args.val_frac is not None and args.train_frac + args.val_frac >= 1:
-        raise SystemExit("--train-frac + --val-frac must be < 1")
+    validate_temporal_fractions(args.train_frac, args.val_frac)
 
-    era5 = args.era5 or args.meteo_mode
-    no_patv_now = args.meteo_mode
-    no_patv_lags = args.meteo_mode
+    era5, no_patv_now, no_patv_lags = meteo_flags_benchmark_style(args)
 
     csv_path = args.csv or default_scada_csv_path()
     if not csv_path.is_file():
@@ -116,8 +109,7 @@ def main() -> None:
     horizons = [int(x.strip()) for x in args.horizons_steps.split(",") if x.strip()]
     if any(h < 1 for h in horizons):
         raise SystemExit("All horizon steps must be >= 1")
-    if args.meteo_max_lag < 0:
-        raise SystemExit("--meteo-max-lag must be >= 0")
+    validate_meteo_max_lag(args.meteo_max_lag)
 
     print(f"Loading TurbID={args.turb_id} (ERA5={era5}, meteo_mode={args.meteo_mode})...")
     df = load_frame_for_run(

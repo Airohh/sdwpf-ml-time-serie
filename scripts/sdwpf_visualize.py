@@ -17,8 +17,10 @@ import re
 import sys
 from pathlib import Path
 
-_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_ROOT / "src"))
+from sdwpf_paths import prepend_src, repo_root_from_here
+
+_ROOT = repo_root_from_here(__file__)
+prepend_src(_ROOT)
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
@@ -34,11 +36,25 @@ from sdwpf import (
     default_weather_csv_path,
     load_frame_for_run,
     project_root,
-    resolve_horizon_steps,
     train_and_evaluate,
 )
+from sdwpf.cli_common import (
+    add_xgb_device_argument,
+    apply_meteo_mode_explore_style,
+    resolve_horizon_steps_or_exit,
+    resolve_xgb_device_or_exit,
+    validate_meteo_max_lag,
+    validate_temporal_fractions,
+)
 from sdwpf.constants import DEFAULT_METEO_MAX_LAG
-from sdwpf.pipeline import resolve_xgb_device_spec
+from sdwpf.kpi_format import (
+    extend_float_row_avg,
+    extend_skill_row,
+    fmt_float,
+    fmt_pct_gain,
+    triple_int_row,
+    triple_stat_row,
+)
 from sdwpf.pipeline import SdwpfRunResult
 
 
@@ -103,47 +119,6 @@ def _feature_label_fr(name: str) -> str:
     return name
 
 
-def _fmt_float(x: float | None, nd: int = 3) -> str:
-    if x is None or (isinstance(x, float) and not np.isfinite(x)):
-        return "—"
-    return f"{float(x):.{nd}f}"
-
-
-def _fmt_pct_gain(model_mae: float | None, baseline_mae: float | None) -> str:
-    if (
-        model_mae is None
-        or baseline_mae is None
-        or not np.isfinite(model_mae)
-        or baseline_mae <= 1e-12
-    ):
-        return "—"
-    return f"{100.0 * (1.0 - float(model_mae) / float(baseline_mae)):.1f}"
-
-
-def _extend_float_row_avg(
-    vals: list[float | None], *, n_t: int, nd: int = 3
-) -> list[str]:
-    """Dernière colonne = moyenne des valeurs finies (pour bloc multi-turbines)."""
-    row = [_fmt_float(v, nd) for v in vals]
-    if n_t > 1:
-        finite = [float(x) for x in vals if x is not None and np.isfinite(x)]
-        row.append(_fmt_float(float(np.mean(finite)), nd) if finite else "—")
-    return row
-
-
-def _extend_skill_row(vals: list[float | None], *, n_t: int) -> list[str]:
-    row: list[str] = []
-    for v in vals:
-        if v is None or not np.isfinite(v):
-            row.append("—")
-        else:
-            row.append(f"{float(v):.4f}")
-    if n_t > 1:
-        finite = [float(x) for x in vals if x is not None and np.isfinite(x)]
-        row.append(f"{float(np.mean(finite)):.4f}" if finite else "—")
-    return row
-
-
 def _export_performance_metrics_table_figure(
     results: list[SdwpfRunResult],
     turb_ids: list[int],
@@ -205,14 +180,14 @@ def _export_performance_metrics_table_figure(
             rows_cell.append(
                 [
                     str(turb_ids[i]),
-                    _fmt_float(r.xgboost_test_mae, 1),
-                    _fmt_float(r.xgboost_test_rmse, 1),
-                    _fmt_float(naive_mae[i], 1),
-                    _fmt_float(r.xgboost_test_nmae_vs_pmax_pct, 1),
-                    _fmt_float(r.xgboost_test_nmae_vs_mean_patv_pct, 1),
+                    fmt_float(r.xgboost_test_mae, 1),
+                    fmt_float(r.xgboost_test_rmse, 1),
+                    fmt_float(naive_mae[i], 1),
+                    fmt_float(r.xgboost_test_nmae_vs_pmax_pct, 1),
+                    fmt_float(r.xgboost_test_nmae_vs_mean_patv_pct, 1),
                     sk_s,
-                    _fmt_pct_gain(xgb_mae[i], naive_mae[i]),
-                    _fmt_float(r.xgboost_test_bias, 1),
+                    fmt_pct_gain(xgb_mae[i], naive_mae[i]),
+                    fmt_float(r.xgboost_test_bias, 1),
                 ]
             )
         mn = _avg(naive_mae)
@@ -225,14 +200,14 @@ def _export_performance_metrics_table_figure(
         rows_cell.append(
             [
                 "μ parc",
-                _fmt_float(_avg(xgb_mae), 1),
-                _fmt_float(_avg([r.xgboost_test_rmse for r in results]), 1),
-                _fmt_float(mn, 1),
-                _fmt_float(_avg([r.xgboost_test_nmae_vs_pmax_pct for r in results]), 1),
-                _fmt_float(_avg([r.xgboost_test_nmae_vs_mean_patv_pct for r in results]), 1),
+                fmt_float(_avg(xgb_mae), 1),
+                fmt_float(_avg([r.xgboost_test_rmse for r in results]), 1),
+                fmt_float(mn, 1),
+                fmt_float(_avg([r.xgboost_test_nmae_vs_pmax_pct for r in results]), 1),
+                fmt_float(_avg([r.xgboost_test_nmae_vs_mean_patv_pct for r in results]), 1),
                 f"{float(np.mean(sks)):.3f}" if sks else "—",
-                _fmt_pct_gain(mx, mn) if mn is not None and mx is not None else "—",
-                _fmt_float(_avg([r.xgboost_test_bias for r in results]), 1),
+                fmt_pct_gain(mx, mn) if mn is not None and mx is not None else "—",
+                fmt_float(_avg([r.xgboost_test_bias for r in results]), 1),
             ]
         )
         skill_col_idx = 6
@@ -309,26 +284,26 @@ def _export_performance_metrics_table_figure(
         col_labels.append("Moyenne")
 
     def _row_from_optional(vals: list[float | None], nd: int = 2) -> list[str]:
-        cells = [_fmt_float(v, nd) for v in vals]
+        cells = [fmt_float(v, nd) for v in vals]
         if n_t > 1:
             a = _avg(vals)
-            cells.append(_fmt_float(a, nd) if a is not None else "—")
+            cells.append(fmt_float(a, nd) if a is not None else "—")
         return cells
 
     def _row_gain_vs_naive() -> list[str]:
-        cells = [_fmt_pct_gain(xgb_mae[i], naive_mae[i]) for i in range(n_t)]
+        cells = [fmt_pct_gain(xgb_mae[i], naive_mae[i]) for i in range(n_t)]
         if n_t > 1:
             mn = _avg(naive_mae)
             mx = _avg(xgb_mae)
-            cells.append(_fmt_pct_gain(mx, mn) if mn is not None and mx is not None else "—")
+            cells.append(fmt_pct_gain(mx, mn) if mn is not None and mx is not None else "—")
         return cells
 
     def _row_gain_vs_persist() -> list[str]:
-        cells = [_fmt_pct_gain(xgb_mae[i], persist_mae[i]) for i in range(n_t)]
+        cells = [fmt_pct_gain(xgb_mae[i], persist_mae[i]) for i in range(n_t)]
         if n_t > 1:
             mp = _avg(persist_mae)
             mx = _avg(xgb_mae)
-            cells.append(_fmt_pct_gain(mx, mp) if mp is not None and mx is not None else "—")
+            cells.append(fmt_pct_gain(mx, mp) if mp is not None and mx is not None else "—")
         return cells
 
     rows_lbl = []
@@ -349,7 +324,7 @@ def _export_performance_metrics_table_figure(
 
     add_row("nMAE XGB vs Pmax train (%)", _row_from_optional([r.xgboost_test_nmae_vs_pmax_pct for r in results], 2))
     add_row("nMAE XGB vs moy. Patv train (%)", _row_from_optional([r.xgboost_test_nmae_vs_mean_patv_pct for r in results], 2))
-    add_row("Skill vs naive (1 − MAE/MAE)", _extend_skill_row([r.xgboost_skill_vs_naive for r in results], n_t=n_t))
+    add_row("Skill vs naive (1 − MAE/MAE)", extend_skill_row([r.xgboost_skill_vs_naive for r in results], n_t=n_t))
     add_row("Gain vs naive = Skill×100 (%)", _row_gain_vs_naive())
     add_row("Bias XGB (moy. y − ŷ, test)", _row_from_optional([r.xgboost_test_bias for r in results], 2))
     add_row("Bias baseline (test)", _row_from_optional([r.naive_test_bias for r in results], 2))
@@ -449,7 +424,7 @@ def _export_kpi_performance_figure(
     n_col = len(col_labels)
 
     def extend_float_row(vals: list[float | None]) -> list[str]:
-        return _extend_float_row_avg(vals, n_t=n_t, nd=3)
+        return extend_float_row_avg(vals, n_t=n_t, nd=3)
 
     xgb_mae_l = [r.xgboost_test_mae for r in results]
     naive_mae_l = [r.naive_mean_train_test_mae for r in results]
@@ -510,41 +485,41 @@ def _export_kpi_performance_figure(
     cells.append(extend_float_row([r.train_patv_pmax for r in results]))
     cells.append(extend_float_row([r.train_patv_mean for r in results]))
     cells.append(
-        _extend_float_row_avg(
+        extend_float_row_avg(
             [r.naive_test_nmae_vs_pmax_pct for r in results], n_t=n_t, nd=2
         )
     )
     cells.append(
-        _extend_float_row_avg(
+        extend_float_row_avg(
             [r.xgboost_test_nmae_vs_pmax_pct for r in results], n_t=n_t, nd=2
         )
     )
     cells.append(
-        _extend_float_row_avg(
+        extend_float_row_avg(
             [r.naive_test_nmae_vs_mean_patv_pct for r in results], n_t=n_t, nd=2
         )
     )
     cells.append(
-        _extend_float_row_avg(
+        extend_float_row_avg(
             [r.xgboost_test_nmae_vs_mean_patv_pct for r in results], n_t=n_t, nd=2
         )
     )
-    cells.append(_extend_skill_row([r.xgboost_skill_vs_naive for r in results], n_t=n_t))
+    cells.append(extend_skill_row([r.xgboost_skill_vs_naive for r in results], n_t=n_t))
 
-    gains_naive = [_fmt_pct_gain(xgb_mae_l[i], naive_mae_l[i]) for i in range(n_t)]
+    gains_naive = [fmt_pct_gain(xgb_mae_l[i], naive_mae_l[i]) for i in range(n_t)]
     if n_t > 1:
         mn = [float(x) for x in naive_mae_l if x is not None]
         mx = [float(x) for x in xgb_mae_l if x is not None]
-        gains_naive.append(_fmt_pct_gain(np.mean(mx), np.mean(mn)) if mn and mx else "—")
+        gains_naive.append(fmt_pct_gain(np.mean(mx), np.mean(mn)) if mn and mx else "—")
     cells.append(gains_naive)
     cells.append(extend_float_row([r.naive_test_bias for r in results]))
     cells.append(extend_float_row([r.xgboost_test_bias for r in results]))
 
-    gains_p = [_fmt_pct_gain(xgb_mae_l[i], persist_mae_l[i]) for i in range(n_t)]
+    gains_p = [fmt_pct_gain(xgb_mae_l[i], persist_mae_l[i]) for i in range(n_t)]
     if n_t > 1:
         mp_ = [float(x) for x in persist_mae_l if x is not None and np.isfinite(x)]
         mx = [float(x) for x in xgb_mae_l if x is not None]
-        gains_p.append(_fmt_pct_gain(np.mean(mx), np.mean(mp_)) if mp_ and mx else "—")
+        gains_p.append(fmt_pct_gain(np.mean(mx), np.mean(mp_)) if mp_ and mx else "—")
     cells.append(gains_p)
 
     KPI_COMPACT_IF_N_TURBINES = 22
@@ -552,34 +527,14 @@ def _export_kpi_performance_figure(
     if compact_mode:
         col_labels = ["Moy. parc", "Min", "Max"]
 
-        def _tri_stat(vals: list[float | None], nd: int = 3) -> list[str]:
-            finite = [float(x) for x in vals if x is not None and np.isfinite(x)]
-            if not finite:
-                return ["—", "—", "—"]
-            return [
-                _fmt_float(float(np.mean(finite)), nd),
-                _fmt_float(float(np.min(finite)), nd),
-                _fmt_float(float(np.max(finite)), nd),
-            ]
-
-        def _tri_int(rows: list[int]) -> list[str]:
-            if not rows:
-                return ["—", "—", "—"]
-            a = np.asarray(rows, dtype=float)
-            return [
-                str(int(round(float(np.mean(a))))),
-                str(int(np.min(a))),
-                str(int(np.max(a))),
-            ]
-
         naive_nums = [float(x) for x in naive_mae_l if x is not None and np.isfinite(x)]
         xgb_nums_f = [float(x) for x in xgb_mae_l if x is not None and np.isfinite(x)]
         mn_avg = float(np.mean(naive_nums)) if naive_nums else None
         mx_avg = float(np.mean(xgb_nums_f)) if xgb_nums_f else None
-        gain_mean = _fmt_pct_gain(mx_avg, mn_avg) if mn_avg and mx_avg else "—"
+        gain_mean = fmt_pct_gain(mx_avg, mn_avg) if mn_avg and mx_avg else "—"
         mp_fin = [float(x) for x in persist_mae_l if x is not None and np.isfinite(x)]
         gain_p_mean = (
-            _fmt_pct_gain(float(np.mean(xgb_nums_f)), float(np.mean(mp_fin)))
+            fmt_pct_gain(float(np.mean(xgb_nums_f)), float(np.mean(mp_fin)))
             if mp_fin and xgb_nums_f
             else "—"
         )
@@ -587,25 +542,25 @@ def _export_kpi_performance_figure(
         cells = [
             [str(horizon_steps)] * 3,
             [f"{hz_h:.2f}"] * 3,
-            _tri_int([r.n_rows for r in results]),
-            _tri_int([r.n_features for r in results]),
+            triple_int_row([r.n_rows for r in results]),
+            triple_int_row([r.n_features for r in results]),
             [split_txt] * 3,
-            _tri_stat(naive_mae_l),
-            _tri_stat([r.naive_mean_train_test_rmse for r in results]),
-            _tri_stat(persist_mae_l),
-            _tri_stat([r.xgboost_val_mae for r in results]),
-            _tri_stat(xgb_mae_l),
-            _tri_stat([r.xgboost_test_rmse for r in results]),
-            _tri_stat([r.train_patv_pmax for r in results]),
-            _tri_stat([r.train_patv_mean for r in results]),
-            _tri_stat([r.naive_test_nmae_vs_pmax_pct for r in results], nd=2),
-            _tri_stat([r.xgboost_test_nmae_vs_pmax_pct for r in results], nd=2),
-            _tri_stat([r.naive_test_nmae_vs_mean_patv_pct for r in results], nd=2),
-            _tri_stat([r.xgboost_test_nmae_vs_mean_patv_pct for r in results], nd=2),
-            _tri_stat([r.xgboost_skill_vs_naive for r in results], nd=4),
+            triple_stat_row(naive_mae_l),
+            triple_stat_row([r.naive_mean_train_test_rmse for r in results]),
+            triple_stat_row(persist_mae_l),
+            triple_stat_row([r.xgboost_val_mae for r in results]),
+            triple_stat_row(xgb_mae_l),
+            triple_stat_row([r.xgboost_test_rmse for r in results]),
+            triple_stat_row([r.train_patv_pmax for r in results]),
+            triple_stat_row([r.train_patv_mean for r in results]),
+            triple_stat_row([r.naive_test_nmae_vs_pmax_pct for r in results], nd=2),
+            triple_stat_row([r.xgboost_test_nmae_vs_pmax_pct for r in results], nd=2),
+            triple_stat_row([r.naive_test_nmae_vs_mean_patv_pct for r in results], nd=2),
+            triple_stat_row([r.xgboost_test_nmae_vs_mean_patv_pct for r in results], nd=2),
+            triple_stat_row([r.xgboost_skill_vs_naive for r in results], nd=4),
             [gain_mean, "—", "—"],
-            _tri_stat([r.naive_test_bias for r in results]),
-            _tri_stat([r.xgboost_test_bias for r in results]),
+            triple_stat_row([r.naive_test_bias for r in results]),
+            triple_stat_row([r.xgboost_test_bias for r in results]),
             [gain_p_mean, "—", "—"],
         ]
 
@@ -692,7 +647,7 @@ def _export_kpi_performance_figure(
         "— Persistance : seulement si Patv(t) est une feature.",
         "",
         f"Résumé : XGBoost test MAE moyen = {mean_xgb:.3f}",
-        f"vs naive = {mean_naive:.3f} ({_fmt_pct_gain(mean_xgb, mean_naive)} % de gain)",
+        f"vs naive = {mean_naive:.3f} ({fmt_pct_gain(mean_xgb, mean_naive)} % de gain)",
     ]
     if np.isfinite(mean_skill):
         lines.append(f"Skill moyen (si fini) ≈ {mean_skill:.4f}")
@@ -700,7 +655,7 @@ def _export_kpi_performance_figure(
         lines.append(f"Bias XGB moyen ≈ {mean_bias_x:.3f}")
     if persist_finite:
         mpv = float(np.mean(persist_finite))
-        lines.append(f"vs persistance = {mpv:.3f} ({_fmt_pct_gain(mean_xgb, mpv)} % de gain)")
+        lines.append(f"vs persistance = {mpv:.3f} ({fmt_pct_gain(mean_xgb, mpv)} % de gain)")
     ax_txt.text(
         0.02,
         0.98,
@@ -801,41 +756,26 @@ def main() -> None:
         action="store_true",
         help="Ne génère pas les figures 05 et 06 (KPI + tableau métriques)",
     )
-    p.add_argument(
-        "--xgb-device",
-        type=str,
-        default=None,
-        metavar="SPEC",
-        help=(
+    add_xgb_device_argument(
+        p,
+        help_text=(
             "XGBoost : auto | cpu | cuda | cuda:N (ordinal GPU, voir doc XGBoost GPU). "
             "Si omis : SDWPF_XGB_DEVICE ou auto."
         ),
     )
     args = p.parse_args()
-    try:
-        xgb_dev = resolve_xgb_device_spec(args.xgb_device)
-    except ValueError as e:
-        raise SystemExit(str(e)) from e
+    xgb_dev = resolve_xgb_device_or_exit(args.xgb_device)
 
+    apply_meteo_mode_explore_style(args)
     if args.meteo_mode:
-        args.era5 = True
-        args.no_patv_now = True
-        args.no_patv_lags = True
-        if args.meteo_max_lag < 0:
-            raise SystemExit("--meteo-max-lag must be >= 0")
+        validate_meteo_max_lag(args.meteo_max_lag)
 
-    if args.val_frac is not None and args.val_frac <= 0:
-        raise SystemExit("--val-frac must be positive when set")
-    if args.val_frac is not None and args.train_frac + args.val_frac >= 1:
-        raise SystemExit("--train-frac + --val-frac must be < 1")
+    validate_temporal_fractions(args.train_frac, args.val_frac)
 
     turb_ids = _parse_turb_ids(args.turb_ids, args.turb_id)
-    try:
-        horizon_steps = resolve_horizon_steps(
-            args.horizon, args.horizon_hours, args.horizon_days
-        )
-    except ValueError as e:
-        raise SystemExit(str(e)) from e
+    horizon_steps = resolve_horizon_steps_or_exit(
+        args.horizon, args.horizon_hours, args.horizon_days
+    )
 
     csv_path = args.csv or default_scada_csv_path()
     if not csv_path.is_file():
