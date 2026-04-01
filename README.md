@@ -1,20 +1,26 @@
-# Prévision de puissance éolienne — séries temporelles
+# Forecasting wind power production under realistic constraints
+
+*Prévision de production éolienne — pipeline reproductible (séries temporelles, multi-sources).*
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Tests: pytest](https://img.shields.io/badge/tests-pytest-0A9EDC?logo=pytest)](https://docs.pytest.org/)
 
-Après la création du dépôt sur GitHub, tu peux ajouter un **badge CI** dans ce fichier (ligne Markdown prête à copier dans [`docs/PUBLICATION_GITHUB.md`](docs/PUBLICATION_GITHUB.md)).
+**En une phrase** : anticiper la production pour mieux **planifier** et **équilibrer** le réseau ; ce dépôt **borne** ce qu’on peut attendre de la **météo seule** (réanalyse + calendrier) à horizon type **J+1**, avec un **découpage temporel strict**, des **baselines explicites** et une **lecture honnête** des métriques — y compris quand le modèle ne « bat » pas une référence simple.
 
-Projet **Data Scientist** : données **France** (Open-Meteo, ODRE), **USA** (Wind Toolkit NLR), **Chine** (SDWPF SCADA + ERA5). Pipeline **XGBoost**, horizon **≥ 1 jour** (144 pas de 10 min), **split temporel** avec option **train / validation / test**, baseline **naive** (moyenne de la cible sur le train), suivi **MLflow** (extra optionnelle `experiments`), **Docker**.
+**Données & périmètre technique** : **France** (Open-Meteo, ODRE), **USA** (Wind Toolkit NLR), **Chine** (SDWPF SCADA + ERA5). Pipeline **XGBoost**, horizons **≥ 1 jour** (144 pas de 10 min), **train / val / test** temporel, baselines **naive** et **persistance** (quand les features le permettent), **MLflow** optionnel (`experiments`), **Docker**.
 
-**Documentation détaillée** : à lire en priorité **[`docs/GUIDE.md`](docs/GUIDE.md)** (parcours, glossaire, pièges, CLI).  
-**Publier sur GitHub** : **[`docs/PUBLICATION_GITHUB.md`](docs/PUBLICATION_GITHUB.md)**.
+**Pour aller plus loin** : **[`docs/GUIDE.md`](docs/GUIDE.md)** (parcours, glossaire, CLI, pièges). Publication Git : **[`docs/PUBLICATION_GITHUB.md`](docs/PUBLICATION_GITHUB.md)** (badges CI, remote, push).
 
 ---
 
 ## Sommaire
 
+- [Problème métier](#problème-métier)
+- [Ce que ce dépôt livre](#ce-que-ce-dépôt-livre)
+- [Résultats & lecture « portfolio »](#résultats--lecture-portfolio)
+- [Lessons learned](#lessons-learned)
+- [Next steps](#next-steps)
 - [Aperçu & flux](#aperçu--flux)
 - [Aperçu visuel (optionnel)](#aperçu-visuel-optionnel)
 - [Structure du dépôt](#structure-du-dépôt)
@@ -22,7 +28,50 @@ Projet **Data Scientist** : données **France** (Open-Meteo, ODRE), **USA** (Win
 - [Documentation](#documentation-complète)
 - [Évaluation](#évaluation-rappel)
 - [Secrets (NLR)](#secrets-nlr)
-- [Conclusion](#conclusion-ce-que-jen-retiens)
+
+---
+
+## Problème métier
+
+Anticiper la production d’un parc éolien sert l’**équilibrage électrique**, le **trading** et les **décisions opérationnelles** (maintenance, contrats). La question n’est pas seulement « quel algorithme tourne ? » mais : **avec quelles informations, à quel horizon, et sous quelles contraintes réalistes la prévision reste-t-elle utile ?**
+
+Ce projet **pose** ce trade-off de façon explicite : en mode **`--meteo-mode`** (SDWPF), les *features* sont essentiellement **calendrier (sin/cos)** et **ERA5** — pas la puissance récente ni le vent SCADA — pour **mesurer** si, dans ce cadre, un gradient boosting apporte encore quelque chose par rapport à une **baseline simple** (moyenne de la cible sur le train), **sans fuite temporelle**.
+
+👉 Le positionnement est donc **produit / risque** autant que **ML** : on documente **la valeur ajoutée informationnelle** de la météo réanalysée à la résolution du jeu, pas un benchmark « classement Kaggle ».
+
+---
+
+## Ce que ce dépôt livre
+
+- Un **fil rouge** éolien **vérifiable** : chargement, features, **split temporel**, métriques (MAE, RMSE, nMAE, skill, biais), figures **01–06** et bench multi-horizon / walk-forward.
+- Des **branches données** (France / USA / Chine) qui montrent aussi **les limites** des sources (ex. production ODRE **nationale** vs météo **ponctuelle** non co-localisée — détail dans [`docs/GUIDE.md`](docs/GUIDE.md)).
+- Des **tests** (`pytest`) et une **CI** GitHub Actions (Python 3.10 / 3.12).
+
+---
+
+## Résultats & lecture « portfolio »
+
+**Constat principal (SDWPF, mode météo seule, horizon type J+1)** : XGBoost peut produire des courbes **plausibles** sur le jeu test, mais sur un **grand parc**, le **skill** vs la baseline naive est souvent **proche de zéro ou légèrement négatif** en MAE moyenne.
+
+👉 **Ce n’est pas un échec de présentation** : c’est une **conclusion exploitable** — elle indique que, **dans ces conditions** (information limitée à réanalyse + calendrier, sans dynamique locale de la machine), **une référence simple reste compétitive**. Les figures **`05_*`** (synthèse parc) et **`06_*`** (détail par turbine : MAE, nMAE, skill, biais) servent à **montrer ce constat chiffré**, pas à embellir artificiellement le gain.
+
+Pour un recruteur ou un pair : *« j’ai isolé la question métier, appliqué une évaluation honnête, et rendu compte des limites de l’information disponible. »*
+
+---
+
+## Lessons learned
+
+- À **résolution 10 min** et **sans Patv récent / vent SCADA** dans les features, la **météo réanalysée seule** **ne suffit souvent pas** à battre une baseline naive sur le **MAE** agrégé — ce qui **cadre** l’attente métier sur ce jeu et cet horizon.
+- La **collocation** des signaux (où est mesurée la prod vs où est prise la météo) **conditionne** l’interprétation : certains couples France ne sont **pas** « turbine + météo au même site ».
+- Un **skill faible ou négatif** **documenté** avec un protocole propre vaut mieux qu’un **gain** obtenu par **fuite** ou par comparaison **biaisée** (ex. persistance affichée seulement quand `patv_now` est présent).
+
+---
+
+## Next steps
+
+- Réinjecter **vent SCADA** et/ou **puissance récente** lorsque la politique métier / contrat de données le permet (là où l’impact opérationnel est souvent le plus fort).
+- **Multi-horizon** systématisé et **incertitude** (intervalles, quantiles, ensembles) pour l’usage réseau / trading.
+- Poursuivre les expérimentations **France / USA** en gardant la **checklist anti-fuite** et une lecture **honnête** des métriques.
 
 ---
 
@@ -192,11 +241,3 @@ docker run --rm -v "%CD%/data:/app/data" sdwpf-forecast python scripts/sdwpf_exp
 ## Secrets (NLR)
 
 Copier `.env.example` vers `.env` et renseigner `NLR_API_KEY` / `NLR_EMAIL` pour `scripts/download_wind_toolkit_nlr.py`.
-
----
-
-## Conclusion (ce que j’en retiens)
-
-**Performance prédictive (SDWPF, honnête)** : en **`--meteo-mode`** avec horizon **type J+1**, XGBoost **produit des prédictions cohérentes** (ordre de grandeur MAE / nMAE raisonnable, courbes test dans `03_*` qui suivent partiellement la vérité), mais sur un **parc large** (ex. 100 turbines) le **skill** vs la baseline **moyenne de la cible sur le train** est souvent **proche de zéro ou légèrement négatif** en MAE moyenne : le modèle n’est **pas** clairement supérieur à une référence très simple. C’est attendu tant que les seules entrées utiles sont **météo réanalysée + calendrier** sans puissance récente ni vent SCADA au pas série. Les figures **`05_*`** (résumé parc si beaucoup de turbines) et **`06_*`** (détail **par turbine** : MAE, nMAE, skill, bias) servent à **le montrer chiffré** plutôt que de prétendre à un gain miracle.
-
-**Méthodo & objectif du dépôt** : **fil rouge** sur un cas éolien réel — **split temporel**, pas de fuite, **horizons longs** pour ne pas simuler une « inertie » à court terme via `Patv(t)` seul. Le mode **`--meteo-mode`** ne met dans les *features* que **calendrier (sin/cos)** + **ERA5**, pas le vent SCADA ni `Patv`. Les branches France / USA illustrent **des sources et leurs limites** (ex. prod nationale vs point météo non co-localisé). L’ambition n’est pas une solution miraculeuse mais un **pipeline explicable** et **honnête** pour un entretien ou un portfolio.
