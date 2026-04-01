@@ -249,7 +249,7 @@ def evaluate_on_indices(
     X = feat[feature_cols].to_numpy(dtype=np.float64)
     y = feat["y_target"].to_numpy(dtype=np.float64)
 
-    X_tr, X_te = X[train_idx], X[test_idx]
+    X_tr = X[train_idx]
     y_tr, y_te = y[train_idx], y[test_idx]
     X_va = X[val_idx] if len(val_idx) else None
     y_va = y[val_idx] if len(val_idx) else None

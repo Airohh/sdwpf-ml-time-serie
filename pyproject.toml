@@ -28,3 +28,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+
+# Ruff : E402 toléré sous scripts/ (imports après prepend_src).
+[tool.ruff.lint.per-file-ignores]
+"scripts/**" = ["E402"]
