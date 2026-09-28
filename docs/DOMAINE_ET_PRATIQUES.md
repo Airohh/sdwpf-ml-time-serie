@@ -44,13 +44,10 @@ Les points suivants guident les choix du dépôt (et ce qu’il reste à renforc
 
 - Modèles de séquence profonds (LSTM / Transformers) : hors scope pour garder un pipeline **léger et auditable**.
 - Prévision météo à l’échéance (nowcasting / NWP downscaling) : les champs ERA5 du jeu sont utilisés **tels quels** dans le pipeline actuel ; une vraie chaîne opérationnelle ferait intervenir des **prévisions** météo au pas concerné, pas seulement l’analyse.
-- Évaluation « walk-forward » multi-fenêtres : un seul split configurable pour l’instant ; extension possible plus tard.
 
 ---
 
 ## Liens dans le dépôt
 
 - **Guide technique détaillé** : [`GUIDE.md`](GUIDE.md)
-- **Plan, attentes et todo** : [`PLAN.md`](PLAN.md)
-- **Inventaire des fichiers** : [`INVENTAIRE_FICHIERS.md`](INVENTAIRE_FICHIERS.md)
 - **Entrée courte** : [`README.md`](../README.md)

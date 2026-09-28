@@ -270,9 +270,9 @@ Les scripts ont été **alignés** sur cette arborescence pour éviter des chemi
 ## 11. Où vivent les fichiers
 
 - **Racine** : configuration (`pyproject.toml`, `Dockerfile`), **`.env`** / **`.env.example`**, **`.gitignore`**, **`README.md`**.
-- **`scripts/`** : **`fetch_open_meteo_wind.py`**, **`download_wind_toolkit_nlr.py`**, **`sdwpf_explore.py`**, **`sdwpf_benchmark.py`**, **`sdwpf_visualize.py`**, **`sdwpf_walkforward.py`**, **`clean_artifacts.py`**.
+- **`scripts/`** : **`fetch_open_meteo_wind.py`**, **`download_wind_toolkit_nlr.py`**, **`sdwpf_explore.py`**, **`sdwpf_benchmark.py`**, **`sdwpf_visualize.py`**, **`reproduce_meteo_figures.py`**, **`sdwpf_walkforward.py`**, **`clean_artifacts.py`**.
 - **`src/sdwpf/`** : bibliothèque SDWPF (chargement, features, entraînement).
-- **`docs/`** : ce guide, **`DOMAINE_ET_PRATIQUES.md`**, **`INVENTAIRE_FICHIERS.md`**.
+- **`docs/`** : ce guide et **`DOMAINE_ET_PRATIQUES.md`**.
 - **`reports/`** : benchmarks ; **`reports/figures/`** pour les PNG.
 
 ---
