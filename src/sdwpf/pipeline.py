@@ -97,14 +97,16 @@ def describe_feature_mode(
     no_patv_lags: bool,
     time_meteo_only: bool,
     meteo_max_lag: int = 0,
+    include_day_of_year: bool = False,
+    era5_at_target: bool = False,
 ) -> str:
     if time_meteo_only:
-        if meteo_max_lag > 0:
-            return (
-                f"time (calendar) + ERA5 + lags 1..{meteo_max_lag} "
-                "+ Wspd_w³ + Wdir_w sin/cos"
-            )
-        return "time (calendar) + ERA5 + Wspd_w³ + Wdir_w sin/cos"
+        cal = "calendar of t+h (hour" + (", day of year)" if include_day_of_year else ")")
+        era5 = f"ERA5 at t + lags 1..{meteo_max_lag}" if meteo_max_lag > 0 else "ERA5 at t"
+        parts = [cal, era5, "Wspd_w³ + Wdir_w sin/cos"]
+        if era5_at_target:
+            parts.append("ERA5 at t+h (oracle)")
+        return " + ".join(parts)
     patv_bits = []
     if not no_patv_now:
         patv_bits.append("patv_now")
@@ -122,6 +124,8 @@ def build_modeling_frame(
     no_patv_lags: bool = False,
     time_meteo_only: bool = False,
     meteo_max_lag: int = DEFAULT_METEO_MAX_LAG,
+    include_day_of_year: bool = False,
+    era5_at_target: bool = False,
 ) -> tuple[pd.DataFrame, list[str]]:
     """Construit la table de modélisation (features + ``y_target``) alignée sur ``df``."""
     if horizon_steps < 1:
@@ -137,6 +141,7 @@ def build_modeling_frame(
         horizon=horizon_steps,
         calendar_encoding=time_meteo_only,
         meteo_max_lag=mlag,
+        era5_at_target=era5_at_target,
     )
     # Échauffement des lags, puis lignes sans cible (fin de série ou instant t+h absent).
     feat = feat.iloc[trim_start:]
@@ -148,6 +153,8 @@ def build_modeling_frame(
         no_patv_lags,
         time_meteo_only=time_meteo_only,
         meteo_max_lag=mlag,
+        include_day_of_year=include_day_of_year,
+        era5_at_target=era5_at_target,
     )
     if not feature_cols:
         raise ValueError(
@@ -339,6 +346,8 @@ def train_and_evaluate(
     no_patv_lags: bool = False,
     time_meteo_only: bool = False,
     meteo_max_lag: int = DEFAULT_METEO_MAX_LAG,
+    include_day_of_year: bool = False,
+    era5_at_target: bool = False,
     xgb_params: dict[str, Any] | None = None,
     early_stopping_rounds: int = 30,
     return_test_predictions: bool = False,
@@ -353,6 +362,8 @@ def train_and_evaluate(
         no_patv_lags=no_patv_lags,
         time_meteo_only=time_meteo_only,
         meteo_max_lag=mlag,
+        include_day_of_year=include_day_of_year,
+        era5_at_target=era5_at_target,
     )
     if val_frac is not None and val_frac > 0:
         train_idx, val_idx, test_idx = temporal_split_train_val_test(
@@ -367,6 +378,8 @@ def train_and_evaluate(
         no_patv_lags=no_patv_lags,
         time_meteo_only=time_meteo_only,
         meteo_max_lag=mlag,
+        include_day_of_year=include_day_of_year,
+        era5_at_target=era5_at_target,
     )
     return evaluate_on_indices(
         feat,
@@ -395,6 +408,8 @@ def train_and_evaluate_pooled(
     no_patv_lags: bool = False,
     time_meteo_only: bool = False,
     meteo_max_lag: int = DEFAULT_METEO_MAX_LAG,
+    include_day_of_year: bool = False,
+    era5_at_target: bool = False,
     xgb_params: dict[str, Any] | None = None,
     early_stopping_rounds: int = 30,
     return_test_predictions: bool = False,
@@ -420,6 +435,8 @@ def train_and_evaluate_pooled(
             no_patv_lags=no_patv_lags,
             time_meteo_only=time_meteo_only,
             meteo_max_lag=mlag,
+            include_day_of_year=include_day_of_year,
+            era5_at_target=era5_at_target,
         )
         if base_cols is None:
             base_cols = cols
@@ -454,6 +471,8 @@ def train_and_evaluate_pooled(
             no_patv_lags=no_patv_lags,
             time_meteo_only=time_meteo_only,
             meteo_max_lag=mlag,
+            include_day_of_year=include_day_of_year,
+            era5_at_target=era5_at_target,
         )
         + f" | pooled {len(frames)} turbines ({POOL_TURB_ID_COL})"
     )

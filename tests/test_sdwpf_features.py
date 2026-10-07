@@ -4,8 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from sdwpf.constants import SDWPF_V1_ANCHOR, STEPS_PER_DAY
-from sdwpf.constants import ERA5_EXTRA_COLS
+from sdwpf.constants import ERA5_EXTRA_COLS, SDWPF_V1_ANCHOR, STEPS_PER_DAY
 from sdwpf.features import (
     add_features,
     build_feature_columns,
@@ -129,6 +128,39 @@ def test_add_features_rejects_duplicate_datetimes():
     df = pd.concat([df, df.iloc[[3]]], ignore_index=True)
     with pytest.raises(ValueError, match="unique datetimes"):
         add_features(df, max_lag=1, horizon=1)
+
+
+def test_calendar_describes_target_time():
+    df = _frame_with_missing_steps(30, missing=[])
+    out = add_features(df, max_lag=0, horizon=6, calendar_encoding=True)
+    target_time = pd.to_datetime(df["datetime"]) + pd.Timedelta(hours=1)
+    minutes = target_time.dt.hour * 60 + target_time.dt.minute
+    assert np.allclose(out["hour_sin"], np.sin(2 * np.pi * minutes / 1440))
+
+
+def test_era5_at_target_reads_weather_at_t_plus_h():
+    df = _frame_with_missing_steps(30, missing=[10])
+    out = add_features(
+        df, max_lag=0, horizon=3, calendar_encoding=True, era5_at_target=True
+    ).set_index("Wspd")
+    assert out.loc[5.0, "Wspd_w_at_target"] == 8.0
+    assert np.isnan(out.loc[7.0, "Wspd_w_at_target"])
+    assert out.loc[5.0, "Wspd_w_cube_at_target"] == 512.0
+    cols = build_feature_columns(
+        out.reset_index(),
+        max_lag=0,
+        no_patv_now=True,
+        no_patv_lags=True,
+        time_meteo_only=True,
+        era5_at_target=True,
+    )
+    assert "Wspd_w_at_target" in cols and "Wdir_w_sin_at_target" in cols
+
+
+def test_era5_at_target_requires_meteo_mode():
+    df = _frame_with_missing_steps(10, missing=[])
+    with pytest.raises(ValueError, match="calendar_encoding"):
+        add_features(df, max_lag=1, horizon=1, era5_at_target=True)
 
 
 def test_add_features_calendar_encoding():

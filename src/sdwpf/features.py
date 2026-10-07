@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 
 from sdwpf.constants import (
+    ERA5_AT_TARGET_SUFFIX,
     ERA5_EXTRA_COLS,
     METEO_WDIR_COS_COL,
     METEO_WDIR_SIN_COL,
@@ -13,6 +14,8 @@ from sdwpf.constants import (
 )
 
 CALENDAR_FEATURE_COLS = ("hour_sin", "hour_cos", "doy_sin", "doy_cos")
+HOUR_FEATURE_COLS = ("hour_sin", "hour_cos")
+DAY_OF_YEAR_FEATURE_COLS = ("doy_sin", "doy_cos")
 
 _STEP = pd.Timedelta(minutes=STEP_MINUTES)
 
@@ -27,21 +30,32 @@ def _value_at_offset(s: pd.Series, dt: pd.DatetimeIndex, steps: int) -> np.ndarr
     return by_time.reindex(dt - steps * _STEP).to_numpy()
 
 
-def _add_calendar_cycles(df: pd.DataFrame) -> pd.DataFrame:
-    """Encode time-of-day and day-of-year as sin/cos (needs ``datetime``)."""
-    if "datetime" not in df.columns:
-        raise ValueError("calendar features require a 'datetime' column")
-    out = df.copy()
-    dt = pd.to_datetime(out["datetime"])
-    minutes = dt.dt.hour * 60 + dt.dt.minute + dt.dt.second / 60.0
+def _add_calendar_cycles(out: pd.DataFrame, when: pd.DatetimeIndex) -> pd.DataFrame:
+    """Heure du jour et jour de l'année en sin/cos, pris à l'instant ``when``."""
+    minutes = np.asarray(when.hour * 60 + when.minute + when.second / 60.0, dtype=float)
     ang_h = 2 * np.pi * minutes / (24 * 60)
     out["hour_sin"] = np.sin(ang_h)
     out["hour_cos"] = np.cos(ang_h)
-    doy = dt.dt.dayofyear.astype(float)
+    doy = np.asarray(when.dayofyear, dtype=float)
     ang_d = 2 * np.pi * (doy - 1) / 365.25
     out["doy_sin"] = np.sin(ang_d)
     out["doy_cos"] = np.cos(ang_d)
     return out
+
+
+def _add_wind_physics(out: pd.DataFrame, suffix: str = "") -> None:
+    """Wspd_w³ (∝ énergie du vent) et sin/cos de Wdir_w, pour les colonnes ERA5 ``*suffix``."""
+    speed, direction = f"Wspd_w{suffix}", f"Wdir_w{suffix}"
+    if speed in out.columns:
+        w = pd.to_numeric(out[speed], errors="coerce").to_numpy(dtype=np.float64)
+        w = np.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)
+        w = np.maximum(w, 0.0)
+        out[f"{METEO_WSPD_CUBE_COL}{suffix}"] = np.power(w, 3.0)
+    if direction in out.columns:
+        wd = pd.to_numeric(out[direction], errors="coerce").to_numpy(dtype=np.float64)
+        rad = np.deg2rad(wd)
+        out[f"{METEO_WDIR_SIN_COL}{suffix}"] = np.sin(rad)
+        out[f"{METEO_WDIR_COS_COL}{suffix}"] = np.cos(rad)
 
 
 def _add_meteo_lags_and_physics(
@@ -55,17 +69,21 @@ def _add_meteo_lags_and_physics(
         s = pd.to_numeric(out[c], errors="coerce")
         for k in range(1, meteo_max_lag + 1):
             out[f"{c}_lag{k}"] = _value_at_offset(s, dt, k)
-    if "Wspd_w" in out.columns:
-        w = pd.to_numeric(out["Wspd_w"], errors="coerce").to_numpy(dtype=np.float64)
-        w = np.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)
-        w = np.maximum(w, 0.0)
-        out[METEO_WSPD_CUBE_COL] = np.power(w, 3.0)
-    if "Wdir_w" in out.columns:
-        wd = pd.to_numeric(out["Wdir_w"], errors="coerce").to_numpy(dtype=np.float64)
-        rad = np.deg2rad(wd)
-        out[METEO_WDIR_SIN_COL] = np.sin(rad)
-        out[METEO_WDIR_COS_COL] = np.cos(rad)
+    _add_wind_physics(out)
     return out
+
+
+def _add_era5_at_target(out: pd.DataFrame, *, dt: pd.DatetimeIndex, horizon: int) -> None:
+    """ERA5 à l'échéance ``t+h`` : réanalyse utilisée comme une prévision météo parfaite.
+
+    Inaccessible en opérationnel (il faudrait une prévision NWP) : sert de borne haute
+    pour mesurer ce que la météo à l'échéance apporterait au modèle.
+    """
+    for c in ERA5_EXTRA_COLS:
+        if c in out.columns:
+            s = pd.to_numeric(out[c], errors="coerce")
+            out[f"{c}{ERA5_AT_TARGET_SUFFIX}"] = _value_at_offset(s, dt, -horizon)
+    _add_wind_physics(out, ERA5_AT_TARGET_SUFFIX)
 
 
 def add_features(
@@ -75,13 +93,17 @@ def add_features(
     *,
     calendar_encoding: bool = False,
     meteo_max_lag: int = 0,
+    era5_at_target: bool = False,
 ) -> pd.DataFrame:
     """Lags et cible ``y_target = Patv(t + horizon × 10 min)``, alignés sur ``datetime``.
 
     Un instant absent de ``df`` donne NaN (lag ou cible), jamais la ligne suivante.
+    Le calendrier (``calendar_encoding``) décrit l'instant prévu ``t+h``, connu à l'avance.
     """
     if horizon < 1:
         raise ValueError("horizon must be >= 1")
+    if era5_at_target and not calendar_encoding:
+        raise ValueError("era5_at_target requires calendar_encoding (meteo mode)")
     if "datetime" not in df.columns:
         raise ValueError("add_features requires a 'datetime' column")
     out = df.copy()
@@ -97,8 +119,10 @@ def add_features(
     out["itmp"] = out["Itmp"]
     out["y_target"] = _value_at_offset(out["Patv"], dt, -horizon)
     if calendar_encoding:
-        out = _add_calendar_cycles(out)
+        out = _add_calendar_cycles(out, dt + horizon * _STEP)
         out = _add_meteo_lags_and_physics(out, meteo_max_lag=int(meteo_max_lag), dt=dt)
+        if era5_at_target:
+            _add_era5_at_target(out, dt=dt, horizon=horizon)
     return out
 
 
@@ -223,11 +247,24 @@ def build_feature_columns(
     *,
     time_meteo_only: bool = False,
     meteo_max_lag: int = 0,
+    include_day_of_year: bool = False,
+    era5_at_target: bool = False,
 ) -> list[str]:
+    """Colonnes passées au modèle.
+
+    ``include_day_of_year`` est désactivé par défaut : sur moins d'un an de données
+    (SDWPF : 245 jours), les jours du test n'existent pas dans le train ; doy_sin/cos
+    deviennent un horodatage déguisé et l'arbre prolonge le niveau de fin de train.
+    """
     era5_in_df = [c for c in ERA5_EXTRA_COLS if c in feat.columns]
+    if era5_at_target and not time_meteo_only:
+        raise ValueError("era5_at_target is only supported with time_meteo_only")
     if time_meteo_only:
-        cal = [c for c in CALENDAR_FEATURE_COLS if c in feat.columns]
-        if len(cal) != len(CALENDAR_FEATURE_COLS):
+        cal_wanted = HOUR_FEATURE_COLS + (
+            DAY_OF_YEAR_FEATURE_COLS if include_day_of_year else ()
+        )
+        cal = [c for c in cal_wanted if c in feat.columns]
+        if len(cal) != len(cal_wanted):
             raise ValueError(
                 "time_meteo_only requires calendar columns; "
                 "use add_features(..., calendar_encoding=True)"
@@ -243,9 +280,18 @@ def build_feature_columns(
                 lc = f"{c}_lag{k}"
                 if lc in feat.columns:
                     cols.append(lc)
-        for name in (METEO_WSPD_CUBE_COL, METEO_WDIR_SIN_COL, METEO_WDIR_COS_COL):
-            if name in feat.columns:
-                cols.append(name)
+        physics = (METEO_WSPD_CUBE_COL, METEO_WDIR_SIN_COL, METEO_WDIR_COS_COL)
+        cols.extend(name for name in physics if name in feat.columns)
+        if era5_at_target:
+            at_target = [
+                f"{name}{ERA5_AT_TARGET_SUFFIX}" for name in (*ERA5_EXTRA_COLS, *physics)
+            ]
+            at_target = [c for c in at_target if c in feat.columns]
+            if not at_target:
+                raise ValueError(
+                    "era5_at_target requires add_features(..., era5_at_target=True)"
+                )
+            cols.extend(at_target)
         return cols
 
     patv_lag_cols = (

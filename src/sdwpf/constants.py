@@ -24,6 +24,9 @@ METEO_WSPD_CUBE_COL = "Wspd_w_cube"
 METEO_WDIR_SIN_COL = "Wdir_w_sin"
 METEO_WDIR_COS_COL = "Wdir_w_cos"
 
+# ERA5 lue à l'échéance t+h (borne haute « prévision météo parfaite »)
+ERA5_AT_TARGET_SUFFIX = "_at_target"
+
 # Modèle pooled : identifiant numérique turbine dans X
 POOL_TURB_ID_COL = "turb_id"
 

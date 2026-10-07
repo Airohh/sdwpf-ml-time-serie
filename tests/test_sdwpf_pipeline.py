@@ -73,7 +73,7 @@ def test_train_and_evaluate_meteo_mode_produces_metrics():
     )
     assert res.horizon_steps == STEPS_PER_DAY
     assert res.n_features == (
-        4 + len(ERA5_EXTRA_COLS) * (1 + DEFAULT_METEO_MAX_LAG) + 3
+        2 + len(ERA5_EXTRA_COLS) * (1 + DEFAULT_METEO_MAX_LAG) + 3
     )
     assert res.n_rows >= 400
     assert res.xgboost_test_mae is not None and res.xgboost_test_rmse is not None
@@ -143,6 +143,38 @@ def test_build_modeling_frame_target_is_exactly_h_ahead_despite_gaps():
         assert (feat["y_target"] - feat["Patv"] == STEPS_PER_DAY).all()
         lead = pd.to_datetime(feat["datetime"]) + pd.Timedelta(days=1)
         assert lead.isin(pd.to_datetime(df["datetime"])).all()
+
+
+def test_era5_at_target_is_an_upper_bound_when_power_follows_target_weather():
+    rng = np.random.default_rng(5)
+    n = 3000
+    df = _synthetic_scada_merged(n, rng)
+    wind = np.clip(8 + np.cumsum(rng.normal(0, 0.3, n)), 0, 25)
+    df["Wspd_w"] = wind
+    df["Patv"] = np.clip(1500 * ((wind - 3) / 9) ** 3, 0, 1500) * (wind >= 3)
+    kw = dict(
+        horizon_steps=STEPS_PER_DAY,
+        no_patv_now=True,
+        no_patv_lags=True,
+        time_meteo_only=True,
+        xgb_device="cpu",
+    )
+    base = train_and_evaluate(df, **kw)
+    oracle = train_and_evaluate(df, era5_at_target=True, **kw)
+    assert "Wspd_w_at_target" in oracle.feature_cols
+    assert "Wspd_w_at_target" not in base.feature_cols
+    assert "doy_sin" not in oracle.feature_cols
+    assert oracle.xgboost_test_mae < 0.3 * base.naive_mean_train_test_mae
+
+
+def test_build_modeling_frame_day_of_year_is_opt_in():
+    rng = np.random.default_rng(6)
+    df = _synthetic_scada_merged(600, rng)
+    kw = dict(horizon_steps=STEPS_PER_DAY, no_patv_now=True, no_patv_lags=True, time_meteo_only=True)
+    _, cols = build_modeling_frame(df, **kw)
+    _, cols_doy = build_modeling_frame(df, include_day_of_year=True, **kw)
+    assert "doy_sin" not in cols and "hour_sin" in cols
+    assert {"doy_sin", "doy_cos"} <= set(cols_doy)
 
 
 def test_train_and_evaluate_full_scada_path():
