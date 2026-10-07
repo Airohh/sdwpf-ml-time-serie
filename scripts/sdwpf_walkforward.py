@@ -37,7 +37,7 @@ from sdwpf.cli_common import (
     resolve_xgb_device_or_exit,
     validate_meteo_max_lag,
 )
-from sdwpf.pipeline import _patv_feature_description
+from sdwpf.pipeline import describe_feature_mode
 
 
 def main() -> None:
@@ -124,7 +124,7 @@ def main() -> None:
         meteo_max_lag=mmlag,
     )
     n = len(feat)
-    patv_desc = _patv_feature_description(
+    patv_desc = describe_feature_mode(
         no_patv_now=no_patv_now,
         no_patv_lags=no_patv_lags,
         time_meteo_only=args.meteo_mode,

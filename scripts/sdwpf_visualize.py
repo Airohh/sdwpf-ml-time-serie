@@ -756,13 +756,7 @@ def main() -> None:
         action="store_true",
         help="Ne génère pas les figures 05 et 06 (KPI + tableau métriques)",
     )
-    add_xgb_device_argument(
-        p,
-        help_text=(
-            "XGBoost : auto | cpu | cuda | cuda:N (ordinal GPU, voir doc XGBoost GPU). "
-            "Si omis : SDWPF_XGB_DEVICE ou auto."
-        ),
-    )
+    add_xgb_device_argument(p)
     args = p.parse_args()
     xgb_dev = resolve_xgb_device_or_exit(args.xgb_device)
 

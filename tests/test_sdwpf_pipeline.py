@@ -13,13 +13,13 @@ from sdwpf.constants import (
 )
 from sdwpf.features import temporal_split_train_val_test
 from sdwpf.pipeline import (
-    _patv_feature_description,
     build_modeling_frame,
+    describe_feature_mode,
     evaluate_on_indices,
-    resolve_xgb_device_spec,
     train_and_evaluate,
     train_and_evaluate_pooled,
 )
+from sdwpf.xgb_device import XGB_DEVICE_ENV, resolve_xgb_device_spec
 
 pytest.importorskip("xgboost")
 
@@ -29,6 +29,13 @@ def test_resolve_xgb_device_spec_accepts_cuda_ordinal():
     assert resolve_xgb_device_spec("CUDA:3") == "cuda:3"
     with pytest.raises(ValueError):
         resolve_xgb_device_spec("gpu")
+
+
+def test_resolve_xgb_device_spec_defaults_to_cpu(monkeypatch):
+    monkeypatch.delenv(XGB_DEVICE_ENV, raising=False)
+    assert resolve_xgb_device_spec(None) == "cpu"
+    monkeypatch.setenv(XGB_DEVICE_ENV, "auto")
+    assert resolve_xgb_device_spec(None) == "auto"
 
 
 def _synthetic_scada_merged(n: int, rng: np.random.Generator) -> pd.DataFrame:
@@ -180,7 +187,7 @@ def test_train_and_evaluate_matches_evaluate_on_indices():
         time_meteo_only=True,
     )
     tr, va, te = temporal_split_train_val_test(len(feat), 0.65, 0.15)
-    patv = _patv_feature_description(
+    patv = describe_feature_mode(
         no_patv_now=True,
         no_patv_lags=True,
         time_meteo_only=True,

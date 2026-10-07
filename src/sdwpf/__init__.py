@@ -27,37 +27,37 @@ from sdwpf.features import (
 )
 from sdwpf.paths import default_scada_csv_path, default_weather_csv_path, project_root
 from sdwpf.pipeline import (
-    XGB_DEVICE_ENV,
     SdwpfRunResult,
     build_modeling_frame,
-    effective_xgb_device,
+    describe_feature_mode,
     evaluate_on_indices,
-    resolve_xgb_device_spec,
     load_frame_for_run,
     maybe_log_mlflow,
     train_and_evaluate,
     train_and_evaluate_pooled,
+)
+from sdwpf.xgb_device import (
+    XGB_DEVICE_ENV,
+    resolve_xgb_device_spec,
     xgboost_built_with_cuda,
 )
 
 __all__ = [
+    "CALENDAR_FEATURE_COLS",
     "DEFAULT_METEO_MAX_LAG",
-    "POOL_TURB_ID_COL",
     "ERA5_EXTRA_COLS",
+    "POOL_TURB_ID_COL",
     "SDWPF_V1_ANCHOR",
     "STEPS_PER_DAY",
     "STEPS_PER_HOUR",
     "XGB_DEVICE_ENV",
     "SdwpfRunResult",
-    "effective_xgb_device",
-    "resolve_xgb_device_spec",
-    "xgboost_built_with_cuda",
-    "CALENDAR_FEATURE_COLS",
     "add_features",
     "build_feature_columns",
     "build_modeling_frame",
     "default_scada_csv_path",
     "default_weather_csv_path",
+    "describe_feature_mode",
     "evaluate_on_indices",
     "load_era5_for_turbine",
     "load_frame_for_run",
@@ -66,6 +66,7 @@ __all__ = [
     "merge_scada_era5",
     "project_root",
     "resolve_horizon_steps",
+    "resolve_xgb_device_spec",
     "sanitize_scada_for_forecasting",
     "temporal_split",
     "temporal_split_by_unique_datetime",
@@ -74,4 +75,5 @@ __all__ = [
     "train_and_evaluate",
     "train_and_evaluate_pooled",
     "walk_forward_indices",
+    "xgboost_built_with_cuda",
 ]

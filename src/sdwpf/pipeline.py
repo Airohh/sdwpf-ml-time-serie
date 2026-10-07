@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import contextlib
 import os
-import re
-import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -26,44 +23,18 @@ from sdwpf.features import (
     temporal_split_train_val_test,
     temporal_split_train_val_test_by_unique_datetime,
 )
+from sdwpf.xgb_device import (
+    XGBOOST_AVAILABLE,
+    device_mismatch_warnings_silenced,
+    fit_xgb_regressor,
+    predict_on_device,
+    resolve_xgb_device_spec,
+)
 
 try:
-    import xgboost as xgb
+    import mlflow
 except ImportError:
-    xgb = None
-
-# Variable d'environnement : voir ``resolve_xgb_device_spec``.
-XGB_DEVICE_ENV = "SDWPF_XGB_DEVICE"
-
-
-def resolve_xgb_device_spec(explicit: str | None) -> str:
-    """Résout le device XGBoost (doc GPU : ``device="cuda"`` ou ``cuda:<ordinal>``).
-
-    Valeurs acceptées : ``auto``, ``cpu``, ``cuda``, ``cuda:0``, ``cuda:1``, …
-    Ordre : argument explicite > ``SDWPF_XGB_DEVICE`` > ``auto``.
-    """
-    raw = (explicit or "").strip().lower()
-    if not raw:
-        raw = os.environ.get(XGB_DEVICE_ENV, "auto").strip().lower()
-    if raw in ("auto", "cpu", "cuda"):
-        return raw
-    if re.fullmatch(r"cuda:\d+", raw):
-        return raw
-    raise ValueError(
-        f"xgb_device invalide {raw!r}: attendu auto, cpu, cuda, ou cuda:<n> "
-        f"(ex. cuda:0). Variable {XGB_DEVICE_ENV}."
-    )
-
-
-# Alias rétrocompatible
-effective_xgb_device = resolve_xgb_device_spec
-
-
-def _xgboost_train_device(dev: str) -> str:
-    """Le booster signale souvent ``cuda:0`` ; un device ``cuda`` nu peut provoquer des replis."""
-    if dev == "cuda":
-        return "cuda:0"
-    return dev
+    mlflow = None
 
 
 def _xgboost_gain_importances(reg: Any, n_features: int) -> np.ndarray:
@@ -82,31 +53,6 @@ def _xgboost_gain_importances(reg: Any, n_features: int) -> np.ndarray:
     if s > 1e-12:
         imp = imp / s
     return imp
-
-
-def xgboost_built_with_cuda() -> bool:
-    if xgb is None:
-        return False
-    try:
-        bi = xgb.build_info()
-    except Exception:
-        return False
-    if isinstance(bi, dict):
-        if bi.get("USE_CUDA") or bi.get("CUDA_VERSION"):
-            return True
-    if isinstance(bi, (list, tuple)):
-        for e in bi:
-            if isinstance(e, dict):
-                name = str(e.get("name", "")).upper()
-                val = str(e.get("value", "")).upper()
-                if name == "USE_CUDA" and val in ("ON", "1", "TRUE", "YES"):
-                    return True
-    return "CUDA" in str(bi).upper() and "OFF" not in str(bi).upper()
-
-try:
-    import mlflow
-except ImportError:
-    mlflow = None
 
 
 @dataclass
@@ -145,7 +91,7 @@ class SdwpfRunResult:
     xgboost_pred_test: np.ndarray | None = None
 
 
-def _patv_feature_description(
+def describe_feature_mode(
     *,
     no_patv_now: bool,
     no_patv_lags: bool,
@@ -277,7 +223,7 @@ def evaluate_on_indices(
     top_imp: list[tuple[str, float]] = []
 
     use_es = (
-        xgb is not None
+        XGBOOST_AVAILABLE
         and X_va is not None
         and len(val_idx) >= 1
         and early_stopping_rounds > 0
@@ -320,107 +266,29 @@ def evaluate_on_indices(
     skill_vs_naive: float | None = None
     x_bias = None
     x_nmae_p = x_nmae_m = None
-    if xgb is not None:
+    if XGBOOST_AVAILABLE:
         fit_kw: dict[str, Any] = {}
         if use_es and y_va is not None:
             fit_kw["eval_set"] = [(X_va, y_va)]
             fit_kw["verbose"] = False
 
         spec = resolve_xgb_device_spec(xgb_device)
-
-        def _fit_with_device(p: dict[str, Any]) -> Any:
-            reg_local = xgb.XGBRegressor(**p)
-            reg_local.fit(X_tr, y_tr, **fit_kw)
-            return reg_local
-
-        def _predict_on_fit_device(reg_: Any, X_all: np.ndarray, dev: str) -> np.ndarray:
-            """Prédiction alignée device (évite « mismatched devices » booster vs CPU)."""
-            if dev.startswith("cuda"):
-                dev_c = _xgboost_train_device(dev)
-                for factory in (xgb.QuantileDMatrix, xgb.DMatrix):
-                    try:
-                        dm = factory(X_all, device=dev_c)
-                        return reg_.get_booster().predict(dm)
-                    except Exception:
-                        continue
-            return reg_.predict(X_all)
-
-        # L’API sklearn + NumPy CPU peut déclencher ce UserWarning pendant fit/predict.
-        _suppress_xgb_mismatch = spec != "cpu"
-        _warn_cm = (
-            warnings.catch_warnings()
-            if _suppress_xgb_mismatch
-            else contextlib.nullcontext()
-        )
-        with _warn_cm:
-            if _suppress_xgb_mismatch:
-                warnings.filterwarnings(
-                    "ignore",
-                    message=r".*(mismatched devices|Falling back to prediction using DMatrix).*",
-                    category=UserWarning,
-                )
-
-            reg: Any = None
-            fit_device = "cpu"
-            if spec == "cpu":
-                p = {
-                    **params,
-                    "tree_method": "hist",
-                    "device": "cpu",
-                    "n_jobs": -1,
-                }
-                reg = _fit_with_device(p)
-                fit_device = "cpu"
-            elif spec == "auto":
-                p_gpu = {
-                    **params,
-                    "tree_method": "hist",
-                    "device": _xgboost_train_device("cuda"),
-                }
-                p_gpu.pop("n_jobs", None)
-                try:
-                    reg = _fit_with_device(p_gpu)
-                    fit_device = _xgboost_train_device("cuda")
-                except Exception as e:
-                    warnings.warn(
-                        f"XGBoost GPU indisponible ({type(e).__name__}: {e}). Repli CPU.",
-                        UserWarning,
-                        stacklevel=2,
-                    )
-                    p = {
-                        **params,
-                        "tree_method": "hist",
-                        "device": "cpu",
-                        "n_jobs": -1,
-                    }
-                    reg = _fit_with_device(p)
-                    fit_device = "cpu"
-            else:
-                if not xgboost_built_with_cuda():
-                    raise RuntimeError(
-                        f"xgb_device={spec!r} requiert XGBoost compilé avec CUDA "
-                        f"(voir https://xgboost.readthedocs.io/en/stable/gpu/index.html ). "
-                        "Installe un build GPU ou utilise auto/cpu."
-                    )
-                dev_fit = _xgboost_train_device(spec)
-                p = {**params, "tree_method": "hist", "device": dev_fit}
-                p.pop("n_jobs", None)
-                reg = _fit_with_device(p)
-                fit_device = dev_fit
-            y_hat = _predict_on_fit_device(reg, X, fit_device)
-            if X_va is not None and len(val_idx) >= 1 and y_va is not None:
-                x_val_mae, x_val_rmse = mae_rmse_on(y_hat, val_idx, y_va)
-            x_mae, x_rmse = test_mae_rmse(y_hat)
-            if naive_mae > 1e-12 and x_mae is not None and np.isfinite(x_mae):
-                skill_vs_naive = float(1.0 - float(x_mae) / float(naive_mae))
-            x_bias = float(np.mean(y_te - y_hat[test_idx]))
-            if train_patv_pmax > 1e-12 and x_mae is not None:
-                x_nmae_p = _pct_mae_over_ref(float(x_mae), train_patv_pmax)
-            if train_patv_mean > 1e-12 and x_mae is not None:
-                x_nmae_m = _pct_mae_over_ref(float(x_mae), train_patv_mean)
-            imp = _xgboost_gain_importances(reg, len(feature_cols))
-            order = np.argsort(imp)[::-1][: min(12, len(feature_cols))]
-            top_imp = [(feature_cols[i], float(imp[i])) for i in order]
+        with device_mismatch_warnings_silenced(spec):
+            reg, fit_device = fit_xgb_regressor(params, X_tr, y_tr, fit_kw=fit_kw, spec=spec)
+            y_hat = predict_on_device(reg, X, fit_device)
+        if X_va is not None and len(val_idx) >= 1 and y_va is not None:
+            x_val_mae, x_val_rmse = mae_rmse_on(y_hat, val_idx, y_va)
+        x_mae, x_rmse = test_mae_rmse(y_hat)
+        if naive_mae > 1e-12 and x_mae is not None and np.isfinite(x_mae):
+            skill_vs_naive = float(1.0 - float(x_mae) / float(naive_mae))
+        x_bias = float(np.mean(y_te - y_hat[test_idx]))
+        if train_patv_pmax > 1e-12 and x_mae is not None:
+            x_nmae_p = _pct_mae_over_ref(float(x_mae), train_patv_pmax)
+        if train_patv_mean > 1e-12 and x_mae is not None:
+            x_nmae_m = _pct_mae_over_ref(float(x_mae), train_patv_mean)
+        imp = _xgboost_gain_importances(reg, len(feature_cols))
+        order = np.argsort(imp)[::-1][: min(12, len(feature_cols))]
+        top_imp = [(feature_cols[i], float(imp[i])) for i in order]
 
     dt_te = y_te_out = x_te = None
     if return_test_predictions and "datetime" in feat.columns:
@@ -494,7 +362,7 @@ def train_and_evaluate(
         train_idx, test_idx = temporal_split(len(feat), train_frac)
         val_idx = np.array([], dtype=np.int64)
 
-    patv_desc = _patv_feature_description(
+    patv_desc = describe_feature_mode(
         no_patv_now=no_patv_now,
         no_patv_lags=no_patv_lags,
         time_meteo_only=time_meteo_only,
@@ -581,7 +449,7 @@ def train_and_evaluate_pooled(
         )
         val_idx = np.array([], dtype=np.int64)
     patv_desc = (
-        _patv_feature_description(
+        describe_feature_mode(
             no_patv_now=no_patv_now,
             no_patv_lags=no_patv_lags,
             time_meteo_only=time_meteo_only,

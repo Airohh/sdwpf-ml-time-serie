@@ -6,9 +6,9 @@ import argparse
 from typing import Any
 
 from sdwpf.features import resolve_horizon_steps
-from sdwpf.pipeline import resolve_xgb_device_spec
+from sdwpf.xgb_device import resolve_xgb_device_spec
 
-XGB_DEVICE_HELP = "auto | cpu | cuda | cuda:N ; si omis → SDWPF_XGB_DEVICE ou auto."
+XGB_DEVICE_HELP = "cpu | auto | cuda | cuda:N ; si omis → SDWPF_XGB_DEVICE ou cpu."
 
 
 def add_xgb_device_argument(
