@@ -5,7 +5,14 @@ import pandas as pd
 import pytest
 
 from sdwpf.constants import ERA5_EXTRA_COLS, SDWPF_V1_ANCHOR
-from sdwpf.data import load_era5_for_turbine, merge_scada_era5, sanitize_scada_for_forecasting
+from sdwpf.data import (
+    load_era5_for_turbine,
+    load_era5_for_turbines,
+    load_one_turbine,
+    load_turbines,
+    merge_scada_era5,
+    sanitize_scada_for_forecasting,
+)
 
 
 def _tiny_scada() -> pd.DataFrame:
@@ -99,3 +106,56 @@ def test_load_era5_filters_negative_wspd_w(tmp_path):
     pd.DataFrame(rows).to_csv(csv, index=False)
     df = load_era5_for_turbine(csv, turb_id=1, chunksize=10)
     assert len(df) == 2
+
+
+def _write_scada_csv(path, turb_ids, n_steps):
+    rows = []
+    for step in range(n_steps):
+        for tid in turb_ids:  # interleaved, like the real file
+            rows.append(
+                {
+                    "TurbID": tid,
+                    "Day": step // 144 + 1,
+                    "Tmstamp": f"{(step % 144) // 6:02d}:{(step % 6) * 10:02d}",
+                    "Wspd": 5.0 + tid,
+                    "Wdir": -5.0,
+                    "Etmp": 20.0,
+                    "Itmp": 25.0,
+                    "Patv": float(100 * tid + step),
+                }
+            )
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+
+def test_load_turbines_single_pass_matches_one_by_one(tmp_path):
+    csv = tmp_path / "scada.csv"
+    _write_scada_csv(csv, [1, 2, 3], n_steps=300)
+    frames = load_turbines(csv, [3, 1], chunksize=97)
+    assert set(frames) == {1, 3}
+    for tid in (1, 3):
+        one = load_one_turbine(csv, tid, chunksize=97)
+        pd.testing.assert_frame_equal(frames[tid], one)
+        assert len(one) == 300 and (one["TurbID"] == tid).all()
+    assert frames[1]["datetime"].iloc[150] == pd.Timestamp(SDWPF_V1_ANCHOR) + pd.Timedelta(minutes=1500)
+
+
+def test_load_turbines_reports_missing_ids(tmp_path):
+    csv = tmp_path / "scada.csv"
+    _write_scada_csv(csv, [1], n_steps=10)
+    with pytest.raises(ValueError, match="TurbID=7"):
+        load_turbines(csv, [1, 7])
+
+
+def test_load_era5_for_turbines_groups_by_id(tmp_path):
+    csv = tmp_path / "w.csv"
+    t0 = pd.Timestamp("2020-05-01 00:00:00")
+    rows = []
+    for i in range(4):
+        for tid in (1, 2):
+            row = {"TurbID": tid, "Tmstamp": (t0 + pd.Timedelta(minutes=10 * i)).isoformat()}
+            row.update({c: float(tid) for c in ERA5_EXTRA_COLS})
+            rows.append(row)
+    pd.DataFrame(rows).to_csv(csv, index=False)
+    eras = load_era5_for_turbines(csv, [1, 2], chunksize=3)
+    assert len(eras[1]) == len(eras[2]) == 4
+    assert (eras[2]["Wspd_w"] == 2.0).all()

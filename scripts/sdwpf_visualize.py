@@ -34,7 +34,7 @@ mpl_use("Agg")
 from sdwpf import (
     default_scada_csv_path,
     default_weather_csv_path,
-    load_frame_for_run,
+    load_frames_for_run,
     project_root,
     train_and_evaluate,
 )
@@ -796,15 +796,17 @@ def main() -> None:
     scatter_parts: list[pd.DataFrame] = []
     results: list[SdwpfRunResult] = []
 
+    # Une seule lecture des CSV SCADA / météo pour toutes les turbines.
+    frames = load_frames_for_run(
+        csv_path=csv_path,
+        turb_ids=turb_ids,
+        chunksize=args.chunksize,
+        era5=args.era5,
+        weather_csv=args.weather_csv,
+        default_weather=default_weather_csv_path(),
+    )
     for tid in turb_ids:
-        df = load_frame_for_run(
-            csv_path=csv_path,
-            turb_id=tid,
-            chunksize=args.chunksize,
-            era5=args.era5,
-            weather_csv=args.weather_csv,
-            default_weather=default_weather_csv_path(),
-        )
+        df = frames.pop(tid)
         series_parts.append(df[["datetime", "Patv", "Wspd"]].copy())
         scatter_parts.append(
             df.iloc[:: max(1, len(df) // max(5000 // len(turb_ids), 1))][

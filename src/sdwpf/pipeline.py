@@ -16,7 +16,7 @@ from sdwpf.constants import (
     STEP_MINUTES,
     XGBOOST_RANDOM_STATE,
 )
-from sdwpf.data import load_era5_for_turbine, load_one_turbine, merge_scada_era5
+from sdwpf.data import load_era5_for_turbines, load_turbines, merge_scada_era5
 from sdwpf.features import (
     add_features,
     build_feature_columns,
@@ -571,6 +571,24 @@ def train_and_evaluate_pooled(
     )
 
 
+def load_frames_for_run(
+    *,
+    csv_path: Path,
+    turb_ids: list[int],
+    chunksize: int,
+    era5: bool,
+    weather_csv: Path | None,
+    default_weather: Path,
+) -> dict[int, pd.DataFrame]:
+    """Charge plusieurs turbines (SCADA, + ERA5 si demandé) en une passe par fichier."""
+    frames = load_turbines(csv_path, turb_ids, chunksize=chunksize)
+    if era5:
+        wpath = weather_csv if weather_csv is not None else default_weather
+        eras = load_era5_for_turbines(wpath, turb_ids, chunksize=chunksize)
+        frames = {tid: merge_scada_era5(df, eras[tid]) for tid, df in frames.items()}
+    return frames
+
+
 def load_frame_for_run(
     *,
     csv_path: Path,
@@ -580,12 +598,14 @@ def load_frame_for_run(
     weather_csv: Path | None,
     default_weather: Path,
 ) -> pd.DataFrame:
-    df = load_one_turbine(csv_path, turb_id, chunksize=chunksize)
-    if era5:
-        wpath = weather_csv if weather_csv is not None else default_weather
-        era = load_era5_for_turbine(wpath, turb_id, chunksize=chunksize)
-        df = merge_scada_era5(df, era)
-    return df
+    return load_frames_for_run(
+        csv_path=csv_path,
+        turb_ids=[turb_id],
+        chunksize=chunksize,
+        era5=era5,
+        weather_csv=weather_csv,
+        default_weather=default_weather,
+    )[int(turb_id)]
 
 
 def maybe_log_mlflow(

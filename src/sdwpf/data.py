@@ -41,6 +41,44 @@ def sanitize_scada_for_forecasting(df: pd.DataFrame) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
+def _rows_by_turbine(
+    csv_path: Path,
+    turb_ids: list[int],
+    chunksize: int,
+    what: str,
+    **read_kw: object,
+) -> dict[int, pd.DataFrame]:
+    """Une seule lecture par chunks du CSV, lignes regroupées par ``TurbID`` demandé."""
+    parts: dict[int, list[pd.DataFrame]] = {int(t): [] for t in turb_ids}
+    wanted = set(parts)
+    for chunk in pd.read_csv(csv_path, chunksize=chunksize, **read_kw):
+        sub = chunk.loc[chunk["TurbID"].isin(wanted)]
+        for tid, rows in sub.groupby("TurbID", sort=False):
+            parts[int(tid)].append(rows.copy())
+    missing = [tid for tid, p in parts.items() if not p]
+    if missing:
+        ids = ", ".join(map(str, missing))
+        raise ValueError(f"No {what} rows for TurbID={ids} in {csv_path}")
+    return {tid: pd.concat(p, ignore_index=True) for tid, p in parts.items()}
+
+
+def load_turbines(
+    csv_path: Path,
+    turb_ids: list[int],
+    chunksize: int = 500_000,
+    anchor: str = SDWPF_V1_ANCHOR,
+) -> dict[int, pd.DataFrame]:
+    """SCADA de plusieurs turbines en **une** passe sur le gros CSV (nettoyées, triées)."""
+    base = pd.Timestamp(anchor)
+    out: dict[int, pd.DataFrame] = {}
+    for tid, df in _rows_by_turbine(csv_path, turb_ids, chunksize, "SCADA").items():
+        day_off = pd.to_timedelta(df["Day"].astype(int) - 1, unit="D")
+        df["datetime"] = base + day_off + _tm_to_timedelta(df["Tmstamp"])
+        df = df.sort_values("datetime").drop_duplicates(subset=["datetime"], keep="first")
+        out[tid] = sanitize_scada_for_forecasting(df)
+    return out
+
+
 def load_one_turbine(
     csv_path: Path,
     turb_id: int,
@@ -48,45 +86,10 @@ def load_one_turbine(
     anchor: str = SDWPF_V1_ANCHOR,
 ) -> pd.DataFrame:
     """Stream the large SCADA CSV and keep rows for a single TurbID."""
-    parts: list[pd.DataFrame] = []
-    base = pd.Timestamp(anchor)
-    for chunk in pd.read_csv(csv_path, chunksize=chunksize):
-        sub = chunk.loc[chunk["TurbID"] == turb_id].copy()
-        if sub.empty:
-            continue
-        day_off = pd.to_timedelta(sub["Day"].astype(int) - 1, unit="D")
-        sub["datetime"] = base + day_off + _tm_to_timedelta(sub["Tmstamp"])
-        parts.append(sub)
-    if not parts:
-        raise ValueError(f"No rows for TurbID={turb_id} in {csv_path}")
-    df = pd.concat(parts, ignore_index=True)
-    df = df.sort_values("datetime").reset_index(drop=True)
-    if df["datetime"].duplicated().any():
-        df = df.drop_duplicates(subset=["datetime"], keep="first")
-    return sanitize_scada_for_forecasting(df)
+    return load_turbines(csv_path, [turb_id], chunksize=chunksize, anchor=anchor)[int(turb_id)]
 
 
-def load_era5_for_turbine(
-    weather_csv: Path,
-    turb_id: int,
-    chunksize: int = 500_000,
-) -> pd.DataFrame:
-    """ERA5 columns from sdwpf_weather_v2 (one row per 10 min per TurbID)."""
-    cols = ["TurbID", "Tmstamp", *ERA5_EXTRA_COLS]
-    want = set(cols)
-    parts: list[pd.DataFrame] = []
-    for chunk in pd.read_csv(
-        weather_csv,
-        chunksize=chunksize,
-        usecols=lambda c: c in want,
-    ):
-        sub = chunk.loc[chunk["TurbID"] == turb_id].copy()
-        if sub.empty:
-            continue
-        parts.append(sub)
-    if not parts:
-        raise ValueError(f"No weather rows for TurbID={turb_id} in {weather_csv}")
-    w = pd.concat(parts, ignore_index=True)
+def _clean_era5(w: pd.DataFrame) -> pd.DataFrame:
     w["datetime"] = pd.to_datetime(w["Tmstamp"], errors="coerce")
     w = w.dropna(subset=["datetime"])
     w = w.sort_values("datetime").drop_duplicates(subset=["datetime"], keep="first")
@@ -96,6 +99,28 @@ def load_era5_for_turbine(
     if "Wspd_w" in w.columns:
         w = w.loc[w["Wspd_w"].isna() | (w["Wspd_w"] >= 0)]
     return w
+
+
+def load_era5_for_turbines(
+    weather_csv: Path,
+    turb_ids: list[int],
+    chunksize: int = 500_000,
+) -> dict[int, pd.DataFrame]:
+    """ERA5 (sdwpf_weather_v2) de plusieurs turbines en une passe sur le CSV météo."""
+    want = {"TurbID", "Tmstamp", *ERA5_EXTRA_COLS}
+    rows = _rows_by_turbine(
+        weather_csv, turb_ids, chunksize, "weather", usecols=lambda c: c in want
+    )
+    return {tid: _clean_era5(w) for tid, w in rows.items()}
+
+
+def load_era5_for_turbine(
+    weather_csv: Path,
+    turb_id: int,
+    chunksize: int = 500_000,
+) -> pd.DataFrame:
+    """ERA5 columns from sdwpf_weather_v2 (one row per 10 min per TurbID)."""
+    return load_era5_for_turbines(weather_csv, [turb_id], chunksize=chunksize)[int(turb_id)]
 
 
 def merge_scada_era5(scada: pd.DataFrame, era5: pd.DataFrame) -> pd.DataFrame:
