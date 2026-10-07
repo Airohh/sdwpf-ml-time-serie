@@ -30,11 +30,14 @@ from sdwpf import (
     train_and_evaluate,
 )
 from sdwpf.cli_common import (
+    add_model_arguments,
     add_xgb_device_argument,
     meteo_flags_benchmark_style,
     resolve_xgb_device_or_exit,
     validate_meteo_max_lag,
+    validate_model_arguments,
     validate_temporal_fractions,
+    xgb_params_from_args,
 )
 
 
@@ -84,6 +87,7 @@ def main() -> None:
         help="Avec --meteo-mode : retards ERA5 1..k.",
     )
     p.add_argument("--weather-csv", type=Path, default=None)
+    add_model_arguments(p)
     add_xgb_device_argument(p)
     p.add_argument(
         "--out-dir",
@@ -95,6 +99,7 @@ def main() -> None:
     xgb_dev = resolve_xgb_device_or_exit(args.xgb_device)
 
     validate_temporal_fractions(args.train_frac, args.val_frac)
+    validate_model_arguments(args)
 
     era5, no_patv_now, no_patv_lags = meteo_flags_benchmark_style(args)
 
@@ -134,10 +139,14 @@ def main() -> None:
             no_patv_lags=no_patv_lags,
             time_meteo_only=args.meteo_mode,
             meteo_max_lag=args.meteo_max_lag,
+            include_day_of_year=args.day_of_year,
+            era5_at_target=args.era5_at_target,
+            xgb_params=xgb_params_from_args(args),
             early_stopping_rounds=args.early_stopping_rounds,
             xgb_device=xgb_dev,
         )
         x_mae = r.xgboost_test_mae
+        c_mae = r.climatology_test_mae
         n_mae = r.naive_mean_train_test_mae
         p_mae = r.persistence_test_mae
         gain = (
@@ -146,6 +155,11 @@ def main() -> None:
         gain_p = (
             (100.0 * (1.0 - x_mae / p_mae))
             if x_mae is not None and p_mae is not None and p_mae > 0
+            else None
+        )
+        gain_c = (
+            (100.0 * (1.0 - x_mae / c_mae))
+            if x_mae is not None and c_mae is not None and c_mae > 0
             else None
         )
         rows.append(
@@ -159,12 +173,18 @@ def main() -> None:
                 "naive_mean_rmse": r.naive_mean_train_test_rmse,
                 "persistence_mae": p_mae,
                 "persistence_rmse": r.persistence_test_rmse,
+                "climatology_mae": c_mae,
+                "climatology_rmse": r.climatology_test_rmse,
+                "power_curve_mae": r.power_curve_test_mae,
+                "power_curve_rmse": r.power_curve_test_rmse,
+                "n_purged": r.n_purged,
                 "xgboost_val_mae": r.xgboost_val_mae,
                 "xgboost_val_rmse": r.xgboost_val_rmse,
                 "xgboost_mae": x_mae,
                 "xgboost_rmse": r.xgboost_test_rmse,
                 "gain_vs_naive_mae_pct": gain,
                 "gain_vs_persistence_mae_pct": gain_p,
+                "gain_vs_climatology_mae_pct": gain_c,
             }
         )
         if r.xgboost_test_mae is not None:
@@ -174,6 +194,8 @@ def main() -> None:
             ptxt = ""
             if gain_p is not None:
                 ptxt = f" gain_vs_persist={gain_p:.1f}%"
+            if gain_c is not None:
+                ptxt += f" gain_vs_clim={gain_c:.1f}%"
             gtxt = f"{gain:.1f}%" if gain is not None else "—"
             print(
                 f"  h={h_steps} ({_label_hours(h_steps)}): "
@@ -187,6 +209,8 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     tag = "meteo" if args.meteo_mode else "full_feats"
+    if args.era5_at_target:
+        tag += "_oracle"
     csv_out = out_dir / f"sdwpf_benchmark_{tag}_{ts}.csv"
     md_out = out_dir / f"sdwpf_benchmark_{tag}_{ts}.md"
 
@@ -194,8 +218,10 @@ def main() -> None:
     table.to_csv(csv_out, index=False)
 
     mode_line = (
-        "**Mode:** temps calendaire (sin/cos) + ERA5 seulement — pas de `Patv`, pas de vent "
-        "/ températures SCADA dans les features\n\n"
+        "**Mode:** calendrier de l'échéance (sin/cos) + ERA5 seulement — pas de `Patv`, pas de "
+        "vent / températures SCADA dans les features"
+        + (" ; ERA5 à l'échéance t+h (borne haute)" if args.era5_at_target else "")
+        + "\n\n"
         if args.meteo_mode
         else "**Mode:** toutes les features Patv autorisées par défaut\n\n"
     )
@@ -213,8 +239,11 @@ def main() -> None:
         f"**ERA5:** {era5}  ",
         mode_line.rstrip(),
         "",
-        "| Horizon | Steps | min | Naive MAE | Pers. MAE | XGB val MAE | XGB test MAE | Gain vs naive % | Gain vs pers. % | test RMSE |",
-        "|---------|-------|-----|-----------|-----------|-------------|--------------|-----------------|-----------------|-----------|",
+        (
+            "| Horizon | Steps | min | Naive MAE | Clim. MAE | Pers. MAE | XGB val MAE "
+            "| XGB test MAE | Gain vs naive % | Gain vs clim. % | Gain vs pers. % | test RMSE |"
+        ),
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for row in rows:
         xmae = row["xgboost_mae"]
@@ -230,9 +259,13 @@ def main() -> None:
         gstr = f"{g:.1f}" if g is not None else "—"
         gpstr = f"{gp:.1f}" if gp is not None else "—"
         pmstr = f"{pmae:.2f}" if pmae is not None else "—"
+        cmae, gc = row["climatology_mae"], row["gain_vs_climatology_mae_pct"]
+        cstr = f"{cmae:.2f}" if cmae is not None else "—"
+        gcstr = f"{gc:.1f}" if gc is not None else "—"
         md_lines.append(
-            f"| {row['horizon_label']} | {row['horizon_steps']} | "
-            f"{row['horizon_minutes']} | {nmae:.2f} | {pmstr} | {vstr} | {xstr} | {gstr} | {gpstr} | {rstr} |"
+            f"| {row['horizon_label']} | {row['horizon_steps']} | {row['horizon_minutes']} "
+            f"| {nmae:.2f} | {cstr} | {pmstr} | {vstr} | {xstr} | {gstr} | {gcstr} | {gpstr} "
+            f"| {rstr} |"
         )
     md_lines += ["", f"CSV: `{csv_out.name}`", ""]
     md_out.write_text("\n".join(md_lines), encoding="utf-8")

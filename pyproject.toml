@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sdwpf"
-version = "0.1.0"
+version = "0.2.0"
 description = "SDWPF loaders, features, and wind power forecasting helpers"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,7 +19,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+# ruff épinglé au mineur : son jeu de règles par défaut évolue entre versions.
+dev = ["pytest>=7.0", "ruff>=0.16,<0.17"]
 experiments = ["mlflow>=2.10"]
 
 [tool.setuptools.packages.find]

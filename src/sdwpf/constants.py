@@ -12,6 +12,7 @@ ERA5_EXTRA_COLS: tuple[str, ...] = (
 )
 
 # 10-minute grid: 6 steps/hour, 144 steps/day
+STEP_MINUTES = 10
 STEPS_PER_HOUR = 6
 STEPS_PER_DAY = 144
 
@@ -22,6 +23,9 @@ DEFAULT_METEO_MAX_LAG = 12
 METEO_WSPD_CUBE_COL = "Wspd_w_cube"
 METEO_WDIR_SIN_COL = "Wdir_w_sin"
 METEO_WDIR_COS_COL = "Wdir_w_cos"
+
+# ERA5 lue à l'échéance t+h (borne haute « prévision météo parfaite »)
+ERA5_AT_TARGET_SUFFIX = "_at_target"
 
 # Modèle pooled : identifiant numérique turbine dans X
 POOL_TURB_ID_COL = "turb_id"

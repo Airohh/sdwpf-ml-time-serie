@@ -60,7 +60,7 @@ def triple_int_row(rows: list[int]) -> list[str]:
         return ["—", "—", "—"]
     a = np.asarray(rows, dtype=float)
     return [
-        str(int(round(float(np.mean(a))))),
+        str(round(float(np.mean(a)))),
         str(int(np.min(a))),
         str(int(np.max(a))),
     ]

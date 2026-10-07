@@ -31,13 +31,16 @@ from sdwpf import (
     walk_forward_indices,
 )
 from sdwpf.cli_common import (
+    add_model_arguments,
     add_xgb_device_argument,
     meteo_flags_benchmark_style,
     resolve_horizon_steps_or_exit,
     resolve_xgb_device_or_exit,
     validate_meteo_max_lag,
+    validate_model_arguments,
+    xgb_params_from_args,
 )
-from sdwpf.pipeline import _patv_feature_description
+from sdwpf.pipeline import describe_feature_mode
 
 
 def main() -> None:
@@ -76,6 +79,7 @@ def main() -> None:
     )
     p.add_argument("--era5", action="store_true")
     p.add_argument("--weather-csv", type=Path, default=None)
+    add_model_arguments(p)
     add_xgb_device_argument(p)
     args = p.parse_args()
     xgb_dev = resolve_xgb_device_or_exit(args.xgb_device)
@@ -87,6 +91,7 @@ def main() -> None:
     ):
         raise SystemExit("--val-frac-within-train must be in (0, 1) when set")
     validate_meteo_max_lag(args.meteo_max_lag)
+    validate_model_arguments(args)
 
     era5, no_patv_now, no_patv_lags = meteo_flags_benchmark_style(args)
 
@@ -122,13 +127,17 @@ def main() -> None:
         no_patv_lags=no_patv_lags,
         time_meteo_only=args.meteo_mode,
         meteo_max_lag=mmlag,
+        include_day_of_year=args.day_of_year,
+        era5_at_target=args.era5_at_target,
     )
     n = len(feat)
-    patv_desc = _patv_feature_description(
+    patv_desc = describe_feature_mode(
         no_patv_now=no_patv_now,
         no_patv_lags=no_patv_lags,
         time_meteo_only=args.meteo_mode,
         meteo_max_lag=mmlag,
+        include_day_of_year=args.day_of_year,
+        era5_at_target=args.era5_at_target,
     )
     try:
         folds = walk_forward_indices(n, n_splits=args.n_splits, test_size=args.test_size)
@@ -147,11 +156,13 @@ def main() -> None:
     xgb_maes: list[float] = []
     naive_maes: list[float] = []
     persist_maes: list[float] = []
+    clim_maes: list[float] = []
+    curve_maes: list[float] = []
 
     for k, (train_block, test_idx) in enumerate(folds):
         if vf is not None:
             ntr = len(train_block)
-            n_va = max(1, int(round(ntr * vf)))
+            n_va = max(1, round(ntr * vf))
             if ntr - n_va < 2:
                 raise SystemExit(
                     f"Fold {k}: train too short after val split ({ntr} rows). "
@@ -159,7 +170,7 @@ def main() -> None:
                 )
             tr_idx = train_block[:-n_va]
             va_idx = train_block[-n_va:]
-            es_eff = es if es > 0 else 0
+            es_eff = max(0, es)
         else:
             tr_idx, va_idx = train_block, np.array([], dtype=np.int64)
             es_eff = 0
@@ -173,6 +184,7 @@ def main() -> None:
             val_idx=va_idx,
             test_idx=test_idx,
             early_stopping_rounds=es_eff,
+            xgb_params=xgb_params_from_args(args),
             xgb_device=xgb_dev,
         )
         xm = r.xgboost_test_mae
@@ -180,12 +192,20 @@ def main() -> None:
             raise SystemExit("xgboost not available; pip install xgboost")
         xgb_maes.append(xm)
         naive_maes.append(r.naive_mean_train_test_mae)
-        if r.persistence_test_mae is not None:
-            persist_maes.append(r.persistence_test_mae)
-        ptxt = f"persist_MAE={r.persistence_test_mae:.2f}" if r.persistence_test_mae else "no persist"
+        extra = []
+        for name, value, acc in (
+            ("clim", r.climatology_test_mae, clim_maes),
+            ("curve", r.power_curve_test_mae, curve_maes),
+            ("persist", r.persistence_test_mae, persist_maes),
+        ):
+            if value is not None:
+                acc.append(value)
+                extra.append(f"{name}_MAE={value:.2f}")
         print(
-            f"  fold {k + 1}/{args.n_splits}: train={len(tr_idx)} val={len(va_idx)} test={len(test_idx)} | "
-            f"naive_MAE={r.naive_mean_train_test_mae:.2f} XGB_test_MAE={xm:.2f} | {ptxt}"
+            f"  fold {k + 1}/{args.n_splits}: train={len(tr_idx)} val={len(va_idx)} "
+            f"test={len(test_idx)} purged={r.n_purged} | "
+            f"naive_MAE={r.naive_mean_train_test_mae:.2f} XGB_test_MAE={xm:.2f} | "
+            + " ".join(extra)
         )
 
     xa = np.array(xgb_maes, dtype=float)
@@ -198,9 +218,13 @@ def main() -> None:
 
     print(f"XGBoost test MAE:   {_msummary(xa)}")
     print(f"Naive test MAE:     {_msummary(na)}")
-    if persist_maes:
-        pa = np.array(persist_maes, dtype=float)
-        print(f"Persistence MAE:    {_msummary(pa)}")
+    for label, maes in (
+        ("Climatology MAE:   ", clim_maes),
+        ("Power curve MAE:   ", curve_maes),
+        ("Persistence MAE:   ", persist_maes),
+    ):
+        if maes:
+            print(f"{label}{_msummary(np.array(maes, dtype=float))}")
 
 
 if __name__ == "__main__":

@@ -4,11 +4,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from sdwpf.constants import SDWPF_V1_ANCHOR, STEPS_PER_DAY
-from sdwpf.constants import ERA5_EXTRA_COLS
+from sdwpf.constants import ERA5_EXTRA_COLS, SDWPF_V1_ANCHOR, STEPS_PER_DAY
 from sdwpf.features import (
     add_features,
     build_feature_columns,
+    purge_target_overlap,
     resolve_horizon_steps,
     temporal_split,
     temporal_split_train_val_test,
@@ -60,6 +60,13 @@ def test_walk_forward_indices():
     assert folds[2][0][-1] == 89
 
 
+def test_purge_target_overlap_keeps_targets_strictly_before_next_block():
+    dt = pd.Series(pd.date_range(pd.Timestamp(SDWPF_V1_ANCHOR), periods=20, freq="10min"))
+    kept = purge_target_overlap(dt, np.arange(10), np.arange(10, 20), horizon_steps=3)
+    assert np.array_equal(kept, np.arange(7))
+    assert np.array_equal(purge_target_overlap(dt, np.arange(10), np.array([], dtype=int), 3), np.arange(10))
+
+
 def test_walk_forward_indices_errors():
     with pytest.raises(ValueError):
         walk_forward_indices(10, n_splits=3, test_size=5)
@@ -83,6 +90,85 @@ def test_add_features_y_target():
     row = out.iloc[5]
     assert row["patv_lag1"] == df.loc[4, "Patv"]
     assert row["y_target"] == df.loc[7, "Patv"]
+
+
+def _frame_with_missing_steps(n: int, missing: list[int]) -> pd.DataFrame:
+    """10-min series where ``Patv = 10 × step`` and some steps are absent (cleaning, join)."""
+    t = pd.date_range(pd.Timestamp(SDWPF_V1_ANCHOR), periods=n, freq="10min")
+    df = pd.DataFrame(
+        {
+            "datetime": t,
+            "Patv": np.arange(n, dtype=float) * 10,
+            "Wspd": np.arange(n, dtype=float),
+            "Wdir": 0.0,
+            "Etmp": 20.0,
+            "Itmp": 25.0,
+        }
+    )
+    for c in ERA5_EXTRA_COLS:
+        df[c] = np.arange(n, dtype=float)
+    return df.drop(index=missing).reset_index(drop=True)
+
+
+def test_add_features_aligns_on_time_not_rows():
+    df = _frame_with_missing_steps(30, missing=[10])
+    out = add_features(df, max_lag=2, horizon=3).set_index("Wspd")
+    # step 7 -> target step 10, absent: NaN (a row shift would return step 11)
+    assert np.isnan(out.loc[7.0, "y_target"])
+    assert out.loc[8.0, "y_target"] == 110.0
+    assert np.isnan(out.loc[11.0, "patv_lag1"])
+    assert out.loc[11.0, "patv_lag2"] == 90.0
+    assert out.loc[12.0, "patv_lag1"] == 110.0
+    assert np.isnan(out.loc[12.0, "wspd_lag2"])
+
+
+def test_add_features_meteo_lags_align_on_time():
+    df = _frame_with_missing_steps(30, missing=[10])
+    out = add_features(
+        df, max_lag=0, horizon=3, calendar_encoding=True, meteo_max_lag=2
+    ).set_index("Wspd")
+    assert np.isnan(out.loc[11.0, "Wspd_w_lag1"])
+    assert out.loc[11.0, "Wspd_w_lag2"] == 9.0
+
+
+def test_add_features_rejects_duplicate_datetimes():
+    df = _frame_with_missing_steps(10, missing=[])
+    df = pd.concat([df, df.iloc[[3]]], ignore_index=True)
+    with pytest.raises(ValueError, match="unique datetimes"):
+        add_features(df, max_lag=1, horizon=1)
+
+
+def test_calendar_describes_target_time():
+    df = _frame_with_missing_steps(30, missing=[])
+    out = add_features(df, max_lag=0, horizon=6, calendar_encoding=True)
+    target_time = pd.to_datetime(df["datetime"]) + pd.Timedelta(hours=1)
+    minutes = target_time.dt.hour * 60 + target_time.dt.minute
+    assert np.allclose(out["hour_sin"], np.sin(2 * np.pi * minutes / 1440))
+
+
+def test_era5_at_target_reads_weather_at_t_plus_h():
+    df = _frame_with_missing_steps(30, missing=[10])
+    out = add_features(
+        df, max_lag=0, horizon=3, calendar_encoding=True, era5_at_target=True
+    ).set_index("Wspd")
+    assert out.loc[5.0, "Wspd_w_at_target"] == 8.0
+    assert np.isnan(out.loc[7.0, "Wspd_w_at_target"])
+    assert out.loc[5.0, "Wspd_w_cube_at_target"] == 512.0
+    cols = build_feature_columns(
+        out.reset_index(),
+        max_lag=0,
+        no_patv_now=True,
+        no_patv_lags=True,
+        time_meteo_only=True,
+        era5_at_target=True,
+    )
+    assert "Wspd_w_at_target" in cols and "Wdir_w_sin_at_target" in cols
+
+
+def test_era5_at_target_requires_meteo_mode():
+    df = _frame_with_missing_steps(10, missing=[])
+    with pytest.raises(ValueError, match="calendar_encoding"):
+        add_features(df, max_lag=1, horizon=1, era5_at_target=True)
 
 
 def test_add_features_calendar_encoding():

@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import contextlib
 import os
-import re
-import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -14,56 +11,33 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 from sdwpf.constants import (
     DEFAULT_METEO_MAX_LAG,
+    ERA5_AT_TARGET_SUFFIX,
     POOL_TURB_ID_COL,
+    STEP_MINUTES,
     XGBOOST_RANDOM_STATE,
 )
-from sdwpf.data import load_era5_for_turbine, load_one_turbine, merge_scada_era5
+from sdwpf.data import load_era5_for_turbines, load_turbines, merge_scada_era5
 from sdwpf.features import (
     add_features,
     build_feature_columns,
+    purge_target_overlap,
     temporal_split,
     temporal_split_by_unique_datetime,
     temporal_split_train_val_test,
     temporal_split_train_val_test_by_unique_datetime,
 )
+from sdwpf.xgb_device import (
+    XGBOOST_AVAILABLE,
+    device_mismatch_warnings_silenced,
+    fit_xgb_regressor,
+    predict_on_device,
+    resolve_xgb_device_spec,
+)
 
 try:
-    import xgboost as xgb
+    import mlflow
 except ImportError:
-    xgb = None
-
-# Variable d'environnement : voir ``resolve_xgb_device_spec``.
-XGB_DEVICE_ENV = "SDWPF_XGB_DEVICE"
-
-
-def resolve_xgb_device_spec(explicit: str | None) -> str:
-    """Résout le device XGBoost (doc GPU : ``device="cuda"`` ou ``cuda:<ordinal>``).
-
-    Valeurs acceptées : ``auto``, ``cpu``, ``cuda``, ``cuda:0``, ``cuda:1``, …
-    Ordre : argument explicite > ``SDWPF_XGB_DEVICE`` > ``auto``.
-    """
-    raw = (explicit or "").strip().lower()
-    if not raw:
-        raw = os.environ.get(XGB_DEVICE_ENV, "auto").strip().lower()
-    if raw in ("auto", "cpu", "cuda"):
-        return raw
-    if re.fullmatch(r"cuda:\d+", raw):
-        return raw
-    raise ValueError(
-        f"xgb_device invalide {raw!r}: attendu auto, cpu, cuda, ou cuda:<n> "
-        f"(ex. cuda:0). Variable {XGB_DEVICE_ENV}."
-    )
-
-
-# Alias rétrocompatible
-effective_xgb_device = resolve_xgb_device_spec
-
-
-def _xgboost_train_device(dev: str) -> str:
-    """Le booster signale souvent ``cuda:0`` ; un device ``cuda`` nu peut provoquer des replis."""
-    if dev == "cuda":
-        return "cuda:0"
-    return dev
+    mlflow = None
 
 
 def _xgboost_gain_importances(reg: Any, n_features: int) -> np.ndarray:
@@ -84,29 +58,29 @@ def _xgboost_gain_importances(reg: Any, n_features: int) -> np.ndarray:
     return imp
 
 
-def xgboost_built_with_cuda() -> bool:
-    if xgb is None:
-        return False
-    try:
-        bi = xgb.build_info()
-    except Exception:
-        return False
-    if isinstance(bi, dict):
-        if bi.get("USE_CUDA") or bi.get("CUDA_VERSION"):
-            return True
-    if isinstance(bi, (list, tuple)):
-        for e in bi:
-            if isinstance(e, dict):
-                name = str(e.get("name", "")).upper()
-                val = str(e.get("value", "")).upper()
-                if name == "USE_CUDA" and val in ("ON", "1", "TRUE", "YES"):
-                    return True
-    return "CUDA" in str(bi).upper() and "OFF" not in str(bi).upper()
+def _group_mean_predict(
+    keys_train: np.ndarray, y_train: np.ndarray, keys_all: np.ndarray, fallback: float
+) -> np.ndarray:
+    """Moyenne train de la cible par clé (ex. heure de l'échéance), ``fallback`` si clé inconnue."""
+    means = pd.Series(y_train).groupby(keys_train).mean()
+    return pd.Series(keys_all).map(means).fillna(fallback).to_numpy(dtype=np.float64)
 
-try:
-    import mlflow
-except ImportError:
-    mlflow = None
+
+def _power_curve_predict(
+    wind_train: np.ndarray,
+    y_train: np.ndarray,
+    wind_all: np.ndarray,
+    fallback: float,
+    bin_width: float = 0.5,
+) -> np.ndarray:
+    """Courbe de puissance empirique : moyenne train par classe de vent, interpolée."""
+    ok = np.isfinite(wind_train)
+    if not ok.any():
+        return np.full(len(wind_all), fallback, dtype=np.float64)
+    curve = pd.Series(y_train[ok]).groupby(np.floor(wind_train[ok] / bin_width)).mean()
+    centers = (curve.index.to_numpy(dtype=np.float64) + 0.5) * bin_width
+    pred = np.interp(wind_all, centers, curve.to_numpy(dtype=np.float64))
+    return np.where(np.isfinite(wind_all), pred, fallback)
 
 
 @dataclass
@@ -123,6 +97,14 @@ class SdwpfRunResult:
     # Uniquement si ``patv_now`` est dans les features : prédire Patv(t) pour cible Patv(t+h).
     persistence_test_mae: float | None = None
     persistence_test_rmse: float | None = None
+    # Moyenne train de la cible par heure du jour de l'échéance (cycle diurne).
+    climatology_test_mae: float | None = None
+    climatology_test_rmse: float | None = None
+    # Courbe de puissance empirique (train) sur Wspd_w à l'échéance ; seulement avec ERA5 à t+h.
+    power_curve_test_mae: float | None = None
+    power_curve_test_rmse: float | None = None
+    # Lignes train / val retirées car leur cible t+h tombe dans le bloc suivant.
+    n_purged: int = 0
     xgboost_val_mae: float | None = None
     xgboost_val_rmse: float | None = None
     xgboost_test_mae: float | None = None
@@ -145,20 +127,22 @@ class SdwpfRunResult:
     xgboost_pred_test: np.ndarray | None = None
 
 
-def _patv_feature_description(
+def describe_feature_mode(
     *,
     no_patv_now: bool,
     no_patv_lags: bool,
     time_meteo_only: bool,
     meteo_max_lag: int = 0,
+    include_day_of_year: bool = False,
+    era5_at_target: bool = False,
 ) -> str:
     if time_meteo_only:
-        if meteo_max_lag > 0:
-            return (
-                f"time (calendar) + ERA5 + lags 1..{meteo_max_lag} "
-                "+ Wspd_w³ + Wdir_w sin/cos"
-            )
-        return "time (calendar) + ERA5 + Wspd_w³ + Wdir_w sin/cos"
+        cal = "calendar of t+h (hour" + (", day of year)" if include_day_of_year else ")")
+        era5 = f"ERA5 at t + lags 1..{meteo_max_lag}" if meteo_max_lag > 0 else "ERA5 at t"
+        parts = [cal, era5, "Wspd_w³ + Wdir_w sin/cos"]
+        if era5_at_target:
+            parts.append("ERA5 at t+h (oracle)")
+        return " + ".join(parts)
     patv_bits = []
     if not no_patv_now:
         patv_bits.append("patv_now")
@@ -176,6 +160,8 @@ def build_modeling_frame(
     no_patv_lags: bool = False,
     time_meteo_only: bool = False,
     meteo_max_lag: int = DEFAULT_METEO_MAX_LAG,
+    include_day_of_year: bool = False,
+    era5_at_target: bool = False,
 ) -> tuple[pd.DataFrame, list[str]]:
     """Construit la table de modélisation (features + ``y_target``) alignée sur ``df``."""
     if horizon_steps < 1:
@@ -191,9 +177,11 @@ def build_modeling_frame(
         horizon=horizon_steps,
         calendar_encoding=time_meteo_only,
         meteo_max_lag=mlag,
+        era5_at_target=era5_at_target,
     )
-    feat = feat.iloc[trim_start:-horizon_steps].reset_index(drop=True)
-    feat = feat.dropna(subset=["y_target"])
+    # Échauffement des lags, puis lignes sans cible (fin de série ou instant t+h absent).
+    feat = feat.iloc[trim_start:]
+    feat = feat.dropna(subset=["y_target"]).reset_index(drop=True)
     feature_cols = build_feature_columns(
         feat,
         max_lag_eff,
@@ -201,6 +189,8 @@ def build_modeling_frame(
         no_patv_lags,
         time_meteo_only=time_meteo_only,
         meteo_max_lag=mlag,
+        include_day_of_year=include_day_of_year,
+        era5_at_target=era5_at_target,
     )
     if not feature_cols:
         raise ValueError(
@@ -222,8 +212,13 @@ def evaluate_on_indices(
     early_stopping_rounds: int = 30,
     return_test_predictions: bool = False,
     xgb_device: str | None = None,
+    purge: bool = True,
 ) -> SdwpfRunResult:
-    """Évalue XGBoost + baselines sur des indices **déjà** calculés (table ``feat``)."""
+    """Évalue XGBoost + baselines sur des indices **déjà** calculés (table ``feat``).
+
+    ``purge`` retire du train (et de la validation) les lignes dont la cible ``t+h``
+    tombe dans le bloc suivant (voir ``purge_target_overlap``).
+    """
     n = len(feat)
     for name, idx in (
         ("train", train_idx),
@@ -245,6 +240,25 @@ def evaluate_on_indices(
         st_va = set(map(int, val_idx))
         if st_tr & st_va or st_va & st_te:
             raise ValueError("train, val, and test indices must be disjoint")
+
+    n_before = len(train_idx) + len(val_idx)
+    if purge:
+        if "datetime" not in feat.columns:
+            raise ValueError("purge requires a 'datetime' column (or pass purge=False)")
+        dts = feat["datetime"]
+        if len(val_idx):
+            train_idx = purge_target_overlap(dts, train_idx, val_idx, horizon_steps)
+            val_idx = purge_target_overlap(dts, val_idx, test_idx, horizon_steps)
+            if not len(val_idx):
+                raise ValueError(
+                    "validation block is shorter than the horizon: nothing left after purge; "
+                    "increase val_frac or the amount of data"
+                )
+        else:
+            train_idx = purge_target_overlap(dts, train_idx, test_idx, horizon_steps)
+        if not len(train_idx):
+            raise ValueError("train is empty after purging targets that overlap the next block")
+    n_purged = n_before - len(train_idx) - len(val_idx)
 
     X = feat[feature_cols].to_numpy(dtype=np.float64)
     y = feat["y_target"].to_numpy(dtype=np.float64)
@@ -271,12 +285,27 @@ def evaluate_on_indices(
         pers_pred = feat["patv_now"].to_numpy(dtype=np.float64)
         persistence_mae, persistence_rmse = test_mae_rmse(pers_pred)
 
+    clim_mae = clim_rmse = None
+    if "datetime" in feat.columns:
+        target_hour = (
+            pd.to_datetime(feat["datetime"]) + pd.Timedelta(minutes=horizon_steps * STEP_MINUTES)
+        ).dt.hour.to_numpy()
+        clim_pred = _group_mean_predict(target_hour[train_idx], y_tr, target_hour, y_train_mean)
+        clim_mae, clim_rmse = test_mae_rmse(clim_pred)
+
+    pc_mae = pc_rmse = None
+    pc_col = f"Wspd_w{ERA5_AT_TARGET_SUFFIX}"
+    if pc_col in feat.columns:
+        wind = feat[pc_col].to_numpy(dtype=np.float64)
+        pc_pred = _power_curve_predict(wind[train_idx], y_tr, wind, y_train_mean)
+        pc_mae, pc_rmse = test_mae_rmse(pc_pred)
+
     x_mae = x_rmse = None
     x_val_mae = x_val_rmse = None
     top_imp: list[tuple[str, float]] = []
 
     use_es = (
-        xgb is not None
+        XGBOOST_AVAILABLE
         and X_va is not None
         and len(val_idx) >= 1
         and early_stopping_rounds > 0
@@ -319,107 +348,29 @@ def evaluate_on_indices(
     skill_vs_naive: float | None = None
     x_bias = None
     x_nmae_p = x_nmae_m = None
-    if xgb is not None:
+    if XGBOOST_AVAILABLE:
         fit_kw: dict[str, Any] = {}
         if use_es and y_va is not None:
             fit_kw["eval_set"] = [(X_va, y_va)]
             fit_kw["verbose"] = False
 
         spec = resolve_xgb_device_spec(xgb_device)
-
-        def _fit_with_device(p: dict[str, Any]) -> Any:
-            reg_local = xgb.XGBRegressor(**p)
-            reg_local.fit(X_tr, y_tr, **fit_kw)
-            return reg_local
-
-        def _predict_on_fit_device(reg_: Any, X_all: np.ndarray, dev: str) -> np.ndarray:
-            """Prédiction alignée device (évite « mismatched devices » booster vs CPU)."""
-            if dev.startswith("cuda"):
-                dev_c = _xgboost_train_device(dev)
-                for factory in (xgb.QuantileDMatrix, xgb.DMatrix):
-                    try:
-                        dm = factory(X_all, device=dev_c)
-                        return reg_.get_booster().predict(dm)
-                    except Exception:
-                        continue
-            return reg_.predict(X_all)
-
-        # L’API sklearn + NumPy CPU peut déclencher ce UserWarning pendant fit/predict.
-        _suppress_xgb_mismatch = spec != "cpu"
-        _warn_cm = (
-            warnings.catch_warnings()
-            if _suppress_xgb_mismatch
-            else contextlib.nullcontext()
-        )
-        with _warn_cm:
-            if _suppress_xgb_mismatch:
-                warnings.filterwarnings(
-                    "ignore",
-                    message=r".*(mismatched devices|Falling back to prediction using DMatrix).*",
-                    category=UserWarning,
-                )
-
-            reg: Any = None
-            fit_device = "cpu"
-            if spec == "cpu":
-                p = {
-                    **params,
-                    "tree_method": "hist",
-                    "device": "cpu",
-                    "n_jobs": -1,
-                }
-                reg = _fit_with_device(p)
-                fit_device = "cpu"
-            elif spec == "auto":
-                p_gpu = {
-                    **params,
-                    "tree_method": "hist",
-                    "device": _xgboost_train_device("cuda"),
-                }
-                p_gpu.pop("n_jobs", None)
-                try:
-                    reg = _fit_with_device(p_gpu)
-                    fit_device = _xgboost_train_device("cuda")
-                except Exception as e:
-                    warnings.warn(
-                        f"XGBoost GPU indisponible ({type(e).__name__}: {e}). Repli CPU.",
-                        UserWarning,
-                        stacklevel=2,
-                    )
-                    p = {
-                        **params,
-                        "tree_method": "hist",
-                        "device": "cpu",
-                        "n_jobs": -1,
-                    }
-                    reg = _fit_with_device(p)
-                    fit_device = "cpu"
-            else:
-                if not xgboost_built_with_cuda():
-                    raise RuntimeError(
-                        f"xgb_device={spec!r} requiert XGBoost compilé avec CUDA "
-                        f"(voir https://xgboost.readthedocs.io/en/stable/gpu/index.html ). "
-                        "Installe un build GPU ou utilise auto/cpu."
-                    )
-                dev_fit = _xgboost_train_device(spec)
-                p = {**params, "tree_method": "hist", "device": dev_fit}
-                p.pop("n_jobs", None)
-                reg = _fit_with_device(p)
-                fit_device = dev_fit
-            y_hat = _predict_on_fit_device(reg, X, fit_device)
-            if X_va is not None and len(val_idx) >= 1 and y_va is not None:
-                x_val_mae, x_val_rmse = mae_rmse_on(y_hat, val_idx, y_va)
-            x_mae, x_rmse = test_mae_rmse(y_hat)
-            if naive_mae > 1e-12 and x_mae is not None and np.isfinite(x_mae):
-                skill_vs_naive = float(1.0 - float(x_mae) / float(naive_mae))
-            x_bias = float(np.mean(y_te - y_hat[test_idx]))
-            if train_patv_pmax > 1e-12 and x_mae is not None:
-                x_nmae_p = _pct_mae_over_ref(float(x_mae), train_patv_pmax)
-            if train_patv_mean > 1e-12 and x_mae is not None:
-                x_nmae_m = _pct_mae_over_ref(float(x_mae), train_patv_mean)
-            imp = _xgboost_gain_importances(reg, len(feature_cols))
-            order = np.argsort(imp)[::-1][: min(12, len(feature_cols))]
-            top_imp = [(feature_cols[i], float(imp[i])) for i in order]
+        with device_mismatch_warnings_silenced(spec):
+            reg, fit_device = fit_xgb_regressor(params, X_tr, y_tr, fit_kw=fit_kw, spec=spec)
+            y_hat = predict_on_device(reg, X, fit_device)
+        if X_va is not None and len(val_idx) >= 1 and y_va is not None:
+            x_val_mae, x_val_rmse = mae_rmse_on(y_hat, val_idx, y_va)
+        x_mae, x_rmse = test_mae_rmse(y_hat)
+        if naive_mae > 1e-12 and x_mae is not None and np.isfinite(x_mae):
+            skill_vs_naive = float(1.0 - float(x_mae) / float(naive_mae))
+        x_bias = float(np.mean(y_te - y_hat[test_idx]))
+        if train_patv_pmax > 1e-12 and x_mae is not None:
+            x_nmae_p = _pct_mae_over_ref(float(x_mae), train_patv_pmax)
+        if train_patv_mean > 1e-12 and x_mae is not None:
+            x_nmae_m = _pct_mae_over_ref(float(x_mae), train_patv_mean)
+        imp = _xgboost_gain_importances(reg, len(feature_cols))
+        order = np.argsort(imp)[::-1][: min(12, len(feature_cols))]
+        top_imp = [(feature_cols[i], float(imp[i])) for i in order]
 
     dt_te = y_te_out = x_te = None
     if return_test_predictions and "datetime" in feat.columns:
@@ -439,6 +390,11 @@ def evaluate_on_indices(
         naive_mean_train_test_rmse=naive_rmse,
         persistence_test_mae=persistence_mae,
         persistence_test_rmse=persistence_rmse,
+        climatology_test_mae=clim_mae,
+        climatology_test_rmse=clim_rmse,
+        power_curve_test_mae=pc_mae,
+        power_curve_test_rmse=pc_rmse,
+        n_purged=n_purged,
         xgboost_val_mae=x_val_mae,
         xgboost_val_rmse=x_val_rmse,
         xgboost_test_mae=x_mae,
@@ -470,6 +426,8 @@ def train_and_evaluate(
     no_patv_lags: bool = False,
     time_meteo_only: bool = False,
     meteo_max_lag: int = DEFAULT_METEO_MAX_LAG,
+    include_day_of_year: bool = False,
+    era5_at_target: bool = False,
     xgb_params: dict[str, Any] | None = None,
     early_stopping_rounds: int = 30,
     return_test_predictions: bool = False,
@@ -484,6 +442,8 @@ def train_and_evaluate(
         no_patv_lags=no_patv_lags,
         time_meteo_only=time_meteo_only,
         meteo_max_lag=mlag,
+        include_day_of_year=include_day_of_year,
+        era5_at_target=era5_at_target,
     )
     if val_frac is not None and val_frac > 0:
         train_idx, val_idx, test_idx = temporal_split_train_val_test(
@@ -493,11 +453,13 @@ def train_and_evaluate(
         train_idx, test_idx = temporal_split(len(feat), train_frac)
         val_idx = np.array([], dtype=np.int64)
 
-    patv_desc = _patv_feature_description(
+    patv_desc = describe_feature_mode(
         no_patv_now=no_patv_now,
         no_patv_lags=no_patv_lags,
         time_meteo_only=time_meteo_only,
         meteo_max_lag=mlag,
+        include_day_of_year=include_day_of_year,
+        era5_at_target=era5_at_target,
     )
     return evaluate_on_indices(
         feat,
@@ -526,6 +488,8 @@ def train_and_evaluate_pooled(
     no_patv_lags: bool = False,
     time_meteo_only: bool = False,
     meteo_max_lag: int = DEFAULT_METEO_MAX_LAG,
+    include_day_of_year: bool = False,
+    era5_at_target: bool = False,
     xgb_params: dict[str, Any] | None = None,
     early_stopping_rounds: int = 30,
     return_test_predictions: bool = False,
@@ -551,6 +515,8 @@ def train_and_evaluate_pooled(
             no_patv_lags=no_patv_lags,
             time_meteo_only=time_meteo_only,
             meteo_max_lag=mlag,
+            include_day_of_year=include_day_of_year,
+            era5_at_target=era5_at_target,
         )
         if base_cols is None:
             base_cols = cols
@@ -580,11 +546,13 @@ def train_and_evaluate_pooled(
         )
         val_idx = np.array([], dtype=np.int64)
     patv_desc = (
-        _patv_feature_description(
+        describe_feature_mode(
             no_patv_now=no_patv_now,
             no_patv_lags=no_patv_lags,
             time_meteo_only=time_meteo_only,
             meteo_max_lag=mlag,
+            include_day_of_year=include_day_of_year,
+            era5_at_target=era5_at_target,
         )
         + f" | pooled {len(frames)} turbines ({POOL_TURB_ID_COL})"
     )
@@ -603,6 +571,24 @@ def train_and_evaluate_pooled(
     )
 
 
+def load_frames_for_run(
+    *,
+    csv_path: Path,
+    turb_ids: list[int],
+    chunksize: int,
+    era5: bool,
+    weather_csv: Path | None,
+    default_weather: Path,
+) -> dict[int, pd.DataFrame]:
+    """Charge plusieurs turbines (SCADA, + ERA5 si demandé) en une passe par fichier."""
+    frames = load_turbines(csv_path, turb_ids, chunksize=chunksize)
+    if era5:
+        wpath = weather_csv if weather_csv is not None else default_weather
+        eras = load_era5_for_turbines(wpath, turb_ids, chunksize=chunksize)
+        frames = {tid: merge_scada_era5(df, eras[tid]) for tid, df in frames.items()}
+    return frames
+
+
 def load_frame_for_run(
     *,
     csv_path: Path,
@@ -612,12 +598,14 @@ def load_frame_for_run(
     weather_csv: Path | None,
     default_weather: Path,
 ) -> pd.DataFrame:
-    df = load_one_turbine(csv_path, turb_id, chunksize=chunksize)
-    if era5:
-        wpath = weather_csv if weather_csv is not None else default_weather
-        era = load_era5_for_turbine(wpath, turb_id, chunksize=chunksize)
-        df = merge_scada_era5(df, era)
-    return df
+    return load_frames_for_run(
+        csv_path=csv_path,
+        turb_ids=[turb_id],
+        chunksize=chunksize,
+        era5=era5,
+        weather_csv=weather_csv,
+        default_weather=default_weather,
+    )[int(turb_id)]
 
 
 def maybe_log_mlflow(
@@ -647,16 +635,23 @@ def maybe_log_mlflow(
                 "n_features": result.n_features,
                 "n_rows": result.n_rows,
                 "patv_feature_mode": result.patv_feature_mode,
+                "n_purged": result.n_purged,
             }
         )
         metrics_base: dict[str, float] = {
             "naive_mean_train_test_mae": result.naive_mean_train_test_mae,
             "naive_mean_train_test_rmse": result.naive_mean_train_test_rmse,
         }
-        if result.persistence_test_mae is not None:
-            metrics_base["persistence_test_mae"] = result.persistence_test_mae
-            if result.persistence_test_rmse is not None:
-                metrics_base["persistence_test_rmse"] = result.persistence_test_rmse
+        for k, v in (
+            ("persistence_test_mae", result.persistence_test_mae),
+            ("persistence_test_rmse", result.persistence_test_rmse),
+            ("climatology_test_mae", result.climatology_test_mae),
+            ("climatology_test_rmse", result.climatology_test_rmse),
+            ("power_curve_test_mae", result.power_curve_test_mae),
+            ("power_curve_test_rmse", result.power_curve_test_rmse),
+        ):
+            if v is not None:
+                metrics_base[k] = float(v)
         mlflow.log_metrics(metrics_base)
         if result.xgboost_val_mae is not None:
             vm = {"xgboost_val_mae": result.xgboost_val_mae}

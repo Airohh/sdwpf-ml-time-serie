@@ -1,11 +1,13 @@
 """
-SDWPF: one turbine, temporal split, XGBoost sur Patv(t+h).
+SDWPF : temporal split, XGBoost sur Patv(t+h), une turbine ou un modèle commun à plusieurs.
 
 Horizon par défaut : 1 jour (144 pas de 10 min) ; h minimal = 1 pas.
 
 Uses package ``sdwpf`` under ``src/``. Run from repo root:
   python scripts/sdwpf_explore.py
   python scripts/sdwpf_explore.py --meteo-mode --horizon-days 2
+  python scripts/sdwpf_explore.py --meteo-mode --era5-at-target
+  python scripts/sdwpf_explore.py --meteo-mode --pooled 1-20
 """
 
 from __future__ import annotations
@@ -22,18 +24,24 @@ from sdwpf import (
     DEFAULT_METEO_MAX_LAG,
     default_scada_csv_path,
     default_weather_csv_path,
-    load_frame_for_run,
+    load_frames_for_run,
     maybe_log_mlflow,
     project_root,
     train_and_evaluate,
+    train_and_evaluate_pooled,
 )
 from sdwpf.cli_common import (
+    add_model_arguments,
     add_xgb_device_argument,
     apply_meteo_mode_explore_style,
+    baseline_summary_lines,
+    parse_turb_ids,
     resolve_horizon_steps_or_exit,
     resolve_xgb_device_or_exit,
     validate_meteo_max_lag,
+    validate_model_arguments,
     validate_temporal_fractions,
+    xgb_params_from_args,
 )
 
 
@@ -43,6 +51,14 @@ def main() -> None:
     )
     p.add_argument("--csv", type=Path, default=None, help="Path to sdwpf_245days_v1.csv")
     p.add_argument("--turb-id", type=int, default=1)
+    p.add_argument(
+        "--pooled",
+        type=str,
+        default=None,
+        metavar="TURB_IDS",
+        help="Un seul XGBoost pour plusieurs turbines (ex. 1-20 ou 1,2,5), split commun "
+        "par instants ; remplace --turb-id.",
+    )
     p.add_argument(
         "--train-frac",
         type=float,
@@ -103,6 +119,7 @@ def main() -> None:
         default=DEFAULT_METEO_MAX_LAG,
         help="Avec --meteo-mode : retards ERA5 1..k (0 = pas de lags sur ERA5).",
     )
+    add_model_arguments(p)
     p.add_argument("--mlflow", action="store_true")
     p.add_argument("--mlflow-experiment", type=str, default="sdwpf")
     p.add_argument("--mlflow-run-name", type=str, default="")
@@ -112,6 +129,8 @@ def main() -> None:
 
     apply_meteo_mode_explore_style(args)
     validate_meteo_max_lag(args.meteo_max_lag)
+    validate_model_arguments(args)
+    turb_ids = parse_turb_ids(args.pooled) if args.pooled else [args.turb_id]
 
     validate_temporal_fractions(args.train_frac, args.val_frac)
 
@@ -125,37 +144,45 @@ def main() -> None:
     if not csv_path.is_file():
         raise SystemExit(f"CSV not found: {csv_path}")
 
-    print(f"Loading TurbID={args.turb_id} from {csv_path} ...")
+    print(f"Loading TurbID={','.join(map(str, turb_ids))} from {csv_path} ...")
     if args.era5:
         wpath = args.weather_csv or default_weather_csv_path()
         if not wpath.is_file():
             raise SystemExit(f"ERA5 CSV not found: {wpath}")
         print(f"Merging ERA5 from {wpath} ...")
 
-    df = load_frame_for_run(
+    frames = load_frames_for_run(
         csv_path=csv_path,
-        turb_id=args.turb_id,
+        turb_ids=turb_ids,
         chunksize=args.chunksize,
         era5=args.era5,
         weather_csv=args.weather_csv,
         default_weather=default_weather_csv_path(),
     )
-    print(f"Rows in frame: {len(df)}")
+    print(f"Rows in frame: {sum(len(df) for df in frames.values())}")
 
+    run_kw = {
+        "horizon_steps": horizon_steps,
+        "train_frac": args.train_frac,
+        "val_frac": args.val_frac,
+        "max_lag": 6,
+        "no_patv_now": args.no_patv_now,
+        "no_patv_lags": args.no_patv_lags,
+        "time_meteo_only": args.meteo_mode,
+        "meteo_max_lag": args.meteo_max_lag,
+        "include_day_of_year": args.day_of_year,
+        "era5_at_target": args.era5_at_target,
+        "xgb_params": xgb_params_from_args(args),
+        "early_stopping_rounds": args.early_stopping_rounds,
+        "xgb_device": xgb_dev,
+    }
     try:
-        result = train_and_evaluate(
-            df,
-            horizon_steps=horizon_steps,
-            train_frac=args.train_frac,
-            val_frac=args.val_frac,
-            max_lag=6,
-            no_patv_now=args.no_patv_now,
-            no_patv_lags=args.no_patv_lags,
-            time_meteo_only=args.meteo_mode,
-            meteo_max_lag=args.meteo_max_lag,
-            early_stopping_rounds=args.early_stopping_rounds,
-            xgb_device=xgb_dev,
-        )
+        if args.pooled:
+            result = train_and_evaluate_pooled(
+                [frames[t] for t in turb_ids], turb_ids, **run_kw
+            )
+        else:
+            result = train_and_evaluate(frames[args.turb_id], **run_kw)
     except ValueError as e:
         raise SystemExit(str(e)) from e
 
@@ -181,6 +208,8 @@ def main() -> None:
             f"Persistence Patv(t)->Patv(t+h) ({split_lbl}) "
             f"MAE={result.persistence_test_mae:.4f} RMSE={result.persistence_test_rmse:.4f}"
         )
+    for line in baseline_summary_lines(result):
+        print(line)
     if result.xgboost_val_mae is not None:
         print(
             f"XGBoost validation ({split_lbl}) MAE={result.xgboost_val_mae:.4f} "
@@ -200,8 +229,8 @@ def main() -> None:
             f"RMSE={result.xgboost_test_rmse:.4f} (gain vs naive MAE ~ {imp:.1f}%){extra}"
         )
         print("Top feature importances:")
-        for name, imp in result.top_importances:
-            print(f"  {name:12s} {imp:.4f}")
+        for name, share in result.top_importances:
+            print(f"  {name:24s} {share:.4f}")
     else:
         print("xgboost not installed; pip install xgboost")
 
@@ -212,7 +241,7 @@ def main() -> None:
             experiment=args.mlflow_experiment,
             run_name=args.mlflow_run_name,
             extra_params={
-                "turb_id": args.turb_id,
+                "turb_id": args.pooled or args.turb_id,
                 "train_frac": args.train_frac,
                 "val_frac": args.val_frac,
                 "early_stopping_rounds": args.early_stopping_rounds,
@@ -220,6 +249,9 @@ def main() -> None:
                 "no_patv_now": args.no_patv_now,
                 "no_patv_lags": args.no_patv_lags,
                 "meteo_mode": args.meteo_mode,
+                "day_of_year": args.day_of_year,
+                "era5_at_target": args.era5_at_target,
+                "xgb_objective": args.xgb_objective or "reg:squarederror",
                 "chunksize": args.chunksize,
             },
         )

@@ -3,7 +3,8 @@ Rejoue les générations de figures PNG SDWPF que tu as utilisées en mode mét�
 
 Chaque preset lance ``scripts/sdwpf_visualize.py`` avec ``--meteo-mode`` et
 ``--horizon-days 1`` (cible Patv à J+1, 144 pas de 10 min), comme pour les
-fichiers ``01_*`` … ``05_kpi_*`` dans ``reports/figures/``.
+fichiers ``01_*`` … ``06_*`` dans ``reports/figures/``. Découpage train 55 % |
+validation 15 % (early stopping) | test 30 % : le test reste les 30 % les plus récents.
 
 Exemples (depuis la racine du projet) :
 
@@ -14,6 +15,7 @@ Exemples (depuis la racine du projet) :
   python scripts/reproduce_meteo_figures.py --preset all --open-folder
   python scripts/reproduce_meteo_figures.py --dry-run --preset all
   python scripts/reproduce_meteo_figures.py --preset multi20 -- --xgb-device cuda
+  python scripts/reproduce_meteo_figures.py --preset multi20 -- --era5-at-target
 """
 
 from __future__ import annotations
@@ -24,20 +26,15 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 _ROOT = Path(__file__).resolve().parent.parent
 _VIS = _ROOT / "scripts" / "sdwpf_visualize.py"
-
-
-def _turb_ids_1_to_n(n: int) -> str:
-    return ",".join(str(i) for i in range(1, n + 1))
 
 
 PRESETS: dict[str, tuple[str, str]] = {
     "single": ("1", "Turbine n°1 → tag ``t1``"),
     "multi5": ("1,2,3,5,8", "5 turbines → tag ``multi_1-2-3-5-8``"),
-    "multi20": (_turb_ids_1_to_n(20), "20 turbines (1–20) → tag ``multi_n20_1-20``"),
-    "multi100": (_turb_ids_1_to_n(100), "100 turbines (1–100) → tag ``multi_n100_1-100``"),
+    "multi20": ("1-20", "20 turbines (1–20) → tag ``multi_n20_1-20``"),
+    "multi100": ("1-100", "100 turbines (1–100) → tag ``multi_n100_1-100``"),
 }
 
 
@@ -53,6 +50,10 @@ def build_cmd(
         "--meteo-mode",
         "--horizon-days",
         "1",
+        "--train-frac",
+        "0.55",
+        "--val-frac",
+        "0.15",
         "--turb-ids",
         turb_ids,
     ]
@@ -70,7 +71,7 @@ def run_one(name: str, turb_ids: str, *, open_folder: bool, dry_run: bool, extra
         return 0
     env = os.environ.copy()
     env.setdefault("PYTHONUTF8", "1")
-    r = subprocess.run(cmd, cwd=_ROOT, env=env)
+    r = subprocess.run(cmd, cwd=_ROOT, env=env, check=False)
     return int(r.returncode)
 
 
@@ -117,7 +118,7 @@ def main() -> None:
         code = run_one(key, spec, open_folder=args.open_folder, dry_run=args.dry_run, extra=extra)
         if code != 0:
             raise SystemExit(code)
-    if args.preset == "all":
+    if args.preset == "all" and not args.dry_run:
         print("\nTous les presets ont été exécutés (fin : multi100 peut être très long).")
 
 
