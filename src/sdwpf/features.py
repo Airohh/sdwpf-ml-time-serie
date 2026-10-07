@@ -8,10 +8,23 @@ from sdwpf.constants import (
     METEO_WDIR_COS_COL,
     METEO_WDIR_SIN_COL,
     METEO_WSPD_CUBE_COL,
+    STEP_MINUTES,
     STEPS_PER_DAY,
 )
 
 CALENDAR_FEATURE_COLS = ("hour_sin", "hour_cos", "doy_sin", "doy_cos")
+
+_STEP = pd.Timedelta(minutes=STEP_MINUTES)
+
+
+def _value_at_offset(s: pd.Series, dt: pd.DatetimeIndex, steps: int) -> np.ndarray:
+    """Valeur de ``s`` à l'instant ``t - steps × 10 min`` (``steps < 0`` : futur), NaN si absent.
+
+    Remplace ``Series.shift`` : un décalage par ligne glisse dès qu'une ligne manque
+    (nettoyage, jointure ERA5), et la cible ``t+h`` tomberait alors des jours plus loin.
+    """
+    by_time = pd.Series(s.to_numpy(), index=dt)
+    return by_time.reindex(dt - steps * _STEP).to_numpy()
 
 
 def _add_calendar_cycles(df: pd.DataFrame) -> pd.DataFrame:
@@ -32,7 +45,7 @@ def _add_calendar_cycles(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _add_meteo_lags_and_physics(
-    out: pd.DataFrame, *, meteo_max_lag: int
+    out: pd.DataFrame, *, meteo_max_lag: int, dt: pd.DatetimeIndex
 ) -> pd.DataFrame:
     """Lags sur les colonnes ERA5 + Wspd_w³ et encodage cyclique de Wdir_w."""
     if meteo_max_lag < 0:
@@ -41,7 +54,7 @@ def _add_meteo_lags_and_physics(
     for c in era_present:
         s = pd.to_numeric(out[c], errors="coerce")
         for k in range(1, meteo_max_lag + 1):
-            out[f"{c}_lag{k}"] = s.shift(k)
+            out[f"{c}_lag{k}"] = _value_at_offset(s, dt, k)
     if "Wspd_w" in out.columns:
         w = pd.to_numeric(out["Wspd_w"], errors="coerce").to_numpy(dtype=np.float64)
         w = np.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)
@@ -63,20 +76,29 @@ def add_features(
     calendar_encoding: bool = False,
     meteo_max_lag: int = 0,
 ) -> pd.DataFrame:
+    """Lags et cible ``y_target = Patv(t + horizon × 10 min)``, alignés sur ``datetime``.
+
+    Un instant absent de ``df`` donne NaN (lag ou cible), jamais la ligne suivante.
+    """
     if horizon < 1:
         raise ValueError("horizon must be >= 1")
+    if "datetime" not in df.columns:
+        raise ValueError("add_features requires a 'datetime' column")
     out = df.copy()
+    dt = pd.DatetimeIndex(pd.to_datetime(out["datetime"]))
+    if dt.has_duplicates:
+        raise ValueError("add_features requires unique datetimes (one turbine per frame)")
     for k in range(1, max_lag + 1):
-        out[f"patv_lag{k}"] = out["Patv"].shift(k)
-        out[f"wspd_lag{k}"] = out["Wspd"].shift(k)
+        out[f"patv_lag{k}"] = _value_at_offset(out["Patv"], dt, k)
+        out[f"wspd_lag{k}"] = _value_at_offset(out["Wspd"], dt, k)
     out["patv_now"] = out["Patv"]
     out["wdir"] = out["Wdir"]
     out["etmp"] = out["Etmp"]
     out["itmp"] = out["Itmp"]
-    out["y_target"] = out["Patv"].shift(-horizon)
+    out["y_target"] = _value_at_offset(out["Patv"], dt, -horizon)
     if calendar_encoding:
         out = _add_calendar_cycles(out)
-        out = _add_meteo_lags_and_physics(out, meteo_max_lag=int(meteo_max_lag))
+        out = _add_meteo_lags_and_physics(out, meteo_max_lag=int(meteo_max_lag), dt=dt)
     return out
 
 

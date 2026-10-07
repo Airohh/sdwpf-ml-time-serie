@@ -20,7 +20,10 @@ def sanitize_scada_for_forecasting(df: pd.DataFrame) -> pd.DataFrame:
 
     - Convertit les colonnes numériques usuelles, retire ``inf`` / ``-inf``.
     - Exige ``Patv`` et ``Wspd`` présents ; écarte les valeurs non physiques
-      (puissance ou vent négatifs ; ``Wdir`` hors ``[0, 360]`` lorsqu'elle est renseignée).
+      (vent négatif ; ``Wdir`` hors ``[-180, 180]`` lorsqu'elle est renseignée : c'est
+      l'angle entre le vent et la nacelle, pas un cap 0–360).
+    - ``Patv < 0`` (consommation des auxiliaires à l'arrêt) est ramené à 0, comme dans
+      la KDD Cup 2022 : supprimer ces lignes retirerait les périodes de vent faible.
     """
     if "datetime" not in df.columns or "Patv" not in df.columns or "Wspd" not in df.columns:
         raise ValueError("sanitize_scada_for_forecasting requires datetime, Patv, Wspd columns")
@@ -29,10 +32,11 @@ def sanitize_scada_for_forecasting(df: pd.DataFrame) -> pd.DataFrame:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce")
     out = out.replace([np.inf, -np.inf], np.nan).dropna(subset=["Patv", "Wspd"])
-    out = out.loc[(out["Patv"] >= 0) & (out["Wspd"] >= 0)]
+    out["Patv"] = out["Patv"].clip(lower=0.0)
+    out = out.loc[out["Wspd"] >= 0]
     if "Wdir" in out.columns:
         wd = out["Wdir"]
-        bad_wdir = wd.notna() & ((wd < 0) | (wd > 360))
+        bad_wdir = wd.notna() & ((wd < -180) | (wd > 180))
         out = out.loc[~bad_wdir]
     return out.reset_index(drop=True)
 

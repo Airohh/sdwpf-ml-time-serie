@@ -125,7 +125,7 @@ Document de synthèse : objectifs, choix, fichiers, faux pas et états actuels. 
 |-----|------------------------|
 | **`Patv`** | **Puissance active** produite (variable cible la plus souvent), en unité du fichier. |
 | **`Wspd`** | **Vitesse du vent** vue par le SCADA (souvent au moyeu ou proche). |
-| **`Wdir`** | **Direction du vent** (angles / conventions du fabricant ou du jeu). |
+| **`Wdir`** | **Angle entre le vent et la nacelle** (°, dans `[-180, 180]`) : erreur d’alignement, pas un cap absolu. |
 | **`Etmp`** | **Température « extérieure »** (capteur ou canal SCADA du dossier). |
 | **`Itmp`** | **Température « intérieure »** (ex. nacelle / équipement). |
 | **`Ndir`**, **`Pab1`–`Pab3`**, **`Prtv`** | Autres signaux (orientation / angles de pale, etc.) — utiles surtout en analyse fine ; le pipeline minimal du projet se concentre sur vent + températures + **`Patv`**. |
@@ -171,8 +171,8 @@ Code réutilisable (ajout de **`src/`** au `PYTHONPATH` par les scripts ; le **`
 
 - **`constants.py`** : ancre **`2020-05-01`**, colonnes ERA5, **`STEPS_PER_HOUR`** (6), **`STEPS_PER_DAY`** (144).
 - **`paths.py`** : racine du dépôt, chemins par défaut SCADA / météo.
-- **`data.py`** : chargement chunké turbine, ERA5, merge ; **nettoyage** : `sanitize_scada_for_forecasting` retire `inf`, puissance ou vent **négatifs**, `Wdir` hors **`[0, 360]`** si renseignée ; ERA5 : exclut `Wspd_w` **négatif** ; fusion : `inf` traités comme manquants puis lignes ERA5 incomplètes exclues.
-- **`features.py`** : lags, cible **`y_target`**, splits temporels **`temporal_split`** / **`temporal_split_train_val_test`**, **`walk_forward_indices`** (walk-forward expansif : listes d’indices train/test contigus), **`resolve_horizon_steps`**.
+- **`data.py`** : chargement chunké turbine, ERA5, merge ; **nettoyage** : `sanitize_scada_for_forecasting` retire `inf`, vent **négatif**, `Wdir` hors **`[-180, 180]`** si renseignée, et ramène `Patv` **négatif** à **0** (convention KDD Cup 2022) ; ERA5 : exclut `Wspd_w` **négatif** ; fusion : `inf` traités comme manquants puis lignes ERA5 incomplètes exclues.
+- **`features.py`** : lags, cible **`y_target`** (calculés sur **`datetime`** : un instant manquant donne NaN, pas la ligne suivante), splits temporels **`temporal_split`** / **`temporal_split_train_val_test`**, **`walk_forward_indices`** (walk-forward expansif : listes d’indices train/test contigus), **`resolve_horizon_steps`**.
 - **`pipeline.py`** : **`train_and_evaluate`** → **`SdwpfRunResult`** (MAE/RMSE **naive**, **persistance** si `patv_now` ∈ features, XGBoost val/test) ; **`load_frame_for_run`** ; **`maybe_log_mlflow`**.
 
 ### Script **`scripts/sdwpf_explore.py`**

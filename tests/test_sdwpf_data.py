@@ -23,28 +23,41 @@ def _tiny_scada() -> pd.DataFrame:
     )
 
 
-def test_sanitize_scada_drops_negative_and_inf():
+def test_sanitize_scada_drops_inf_negative_wspd_and_bad_wdir():
     out = sanitize_scada_for_forecasting(_tiny_scada())
-    # Rows 0,1 valides ; 2 inf ; 3 Patv<0 ; 4 Wspd<0 ; 5 valide (Wdir NaN conservé)
+    # Rows 0,1 valides ; 2 inf ; 3 Wdir=400 ; 4 Wspd<0 ; 5 valide (Wdir NaN conservé)
     assert len(out) == 3
     assert not np.isinf(out["Patv"]).any()
     assert (out["Patv"] >= 0).all() and (out["Wspd"] >= 0).all()
 
 
-def test_sanitize_scada_drops_invalid_wdir():
+def test_sanitize_scada_clips_negative_patv_to_zero():
     df = pd.DataFrame(
         {
             "datetime": pd.date_range(pd.Timestamp(SDWPF_V1_ANCHOR), periods=3, freq="10min"),
-            "Patv": [1.0, 2.0, 3.0],
-            "Wspd": [4.0, 5.0, 6.0],
-            "Wdir": [0.0, 500.0, 270.0],
-            "Etmp": [20.0, 20.0, 20.0],
-            "Itmp": [25.0, 25.0, 25.0],
+            "Patv": [-0.3, 0.0, 250.0],
+            "Wspd": [1.5, 2.0, 7.0],
         }
     )
     out = sanitize_scada_for_forecasting(df)
-    assert len(out) == 2
-    assert 500.0 not in out["Wdir"].values
+    assert len(out) == 3
+    assert out["Patv"].tolist() == [0.0, 0.0, 250.0]
+
+
+def test_sanitize_scada_wdir_valid_range_is_minus_180_to_180():
+    # Wdir = angle vent / nacelle : les valeurs négatives sont normales
+    df = pd.DataFrame(
+        {
+            "datetime": pd.date_range(pd.Timestamp(SDWPF_V1_ANCHOR), periods=5, freq="10min"),
+            "Patv": [1.0, 2.0, 3.0, 4.0, 5.0],
+            "Wspd": [4.0, 5.0, 6.0, 7.0, 8.0],
+            "Wdir": [-180.0, -12.5, 180.0, 270.0, -200.0],
+            "Etmp": [20.0] * 5,
+            "Itmp": [25.0] * 5,
+        }
+    )
+    out = sanitize_scada_for_forecasting(df)
+    assert out["Wdir"].tolist() == [-180.0, -12.5, 180.0]
 
 
 def test_sanitize_scada_requires_columns():

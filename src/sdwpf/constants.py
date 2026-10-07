@@ -12,6 +12,7 @@ ERA5_EXTRA_COLS: tuple[str, ...] = (
 )
 
 # 10-minute grid: 6 steps/hour, 144 steps/day
+STEP_MINUTES = 10
 STEPS_PER_HOUR = 6
 STEPS_PER_DAY = 144
 

@@ -192,8 +192,9 @@ def build_modeling_frame(
         calendar_encoding=time_meteo_only,
         meteo_max_lag=mlag,
     )
-    feat = feat.iloc[trim_start:-horizon_steps].reset_index(drop=True)
-    feat = feat.dropna(subset=["y_target"])
+    # Échauffement des lags, puis lignes sans cible (fin de série ou instant t+h absent).
+    feat = feat.iloc[trim_start:]
+    feat = feat.dropna(subset=["y_target"]).reset_index(drop=True)
     feature_cols = build_feature_columns(
         feat,
         max_lag_eff,

@@ -85,6 +85,52 @@ def test_add_features_y_target():
     assert row["y_target"] == df.loc[7, "Patv"]
 
 
+def _frame_with_missing_steps(n: int, missing: list[int]) -> pd.DataFrame:
+    """10-min series where ``Patv = 10 × step`` and some steps are absent (cleaning, join)."""
+    t = pd.date_range(pd.Timestamp(SDWPF_V1_ANCHOR), periods=n, freq="10min")
+    df = pd.DataFrame(
+        {
+            "datetime": t,
+            "Patv": np.arange(n, dtype=float) * 10,
+            "Wspd": np.arange(n, dtype=float),
+            "Wdir": 0.0,
+            "Etmp": 20.0,
+            "Itmp": 25.0,
+        }
+    )
+    for c in ERA5_EXTRA_COLS:
+        df[c] = np.arange(n, dtype=float)
+    return df.drop(index=missing).reset_index(drop=True)
+
+
+def test_add_features_aligns_on_time_not_rows():
+    df = _frame_with_missing_steps(30, missing=[10])
+    out = add_features(df, max_lag=2, horizon=3).set_index("Wspd")
+    # step 7 -> target step 10, absent: NaN (a row shift would return step 11)
+    assert np.isnan(out.loc[7.0, "y_target"])
+    assert out.loc[8.0, "y_target"] == 110.0
+    assert np.isnan(out.loc[11.0, "patv_lag1"])
+    assert out.loc[11.0, "patv_lag2"] == 90.0
+    assert out.loc[12.0, "patv_lag1"] == 110.0
+    assert np.isnan(out.loc[12.0, "wspd_lag2"])
+
+
+def test_add_features_meteo_lags_align_on_time():
+    df = _frame_with_missing_steps(30, missing=[10])
+    out = add_features(
+        df, max_lag=0, horizon=3, calendar_encoding=True, meteo_max_lag=2
+    ).set_index("Wspd")
+    assert np.isnan(out.loc[11.0, "Wspd_w_lag1"])
+    assert out.loc[11.0, "Wspd_w_lag2"] == 9.0
+
+
+def test_add_features_rejects_duplicate_datetimes():
+    df = _frame_with_missing_steps(10, missing=[])
+    df = pd.concat([df, df.iloc[[3]]], ignore_index=True)
+    with pytest.raises(ValueError, match="unique datetimes"):
+        add_features(df, max_lag=1, horizon=1)
+
+
 def test_add_features_calendar_encoding():
     base = pd.Timestamp(SDWPF_V1_ANCHOR)
     t = pd.date_range(base, periods=10, freq="10min")

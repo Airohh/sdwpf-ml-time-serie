@@ -30,11 +30,11 @@ Les points suivants guident les choix du dépôt (et ce qu’il reste à renforc
 
 1. **Temporalité** : tout découpage d’apprentissage et d’évaluation respecte l’ordre du temps ; pas de validation strictement « au hasard » sur la série.
 2. **Baselines alignées sur l’information** : comparer le modèle à une baseline qui n’utilise **que** ce que le modèle peut voir (ex. moyenne de la cible sur le **train** projetée sur le test, lorsque la persistance s’avère biaisée).
-3. **Horizons explicites** : imposer un minimum d’horizon (ici **144** pas) pour coller à une prévision « jour et au-delà », pas seulement quelques pas devant.
+3. **Horizons explicites** : imposer un minimum d’horizon (ici **144** pas) pour coller à une prévision « jour et au-delà », pas seulement quelques pas devant. Lags et cible se calculent **sur le temps** (`t ± k × 10 min`), pas par ligne : une ligne manquante ne doit pas décaler la cible (voir `add_features`).
 4. **Séparation val / test** : early stopping sur la validation ; **ne pas** optimiser sur le test.
 5. **Reproductibilité** : versions de bibliothèques dans `pyproject.toml` ; `random_state` fixé pour XGBoost (constante dans `sdwpf.constants`).
 6. **Données et secrets** : gros fichiers et dossiers `data/` hors Git ; clés API uniquement dans `.env` (voir `.env.example`).
-7. **Qualité des mesures** : exclure les valeurs non physiques évidentes sur SCADA (puissance / vent négatifs, directions hors plage, `inf`) et filtrer ERA5 incohérent (`Wspd_w` négatif) avant modélisation — voir `sanitize_scada_for_forecasting` et `merge_scada_era5`.
+7. **Qualité des mesures** : exclure les valeurs non physiques évidentes sur SCADA (vent négatif, directions hors plage, `inf`), ramener `Patv < 0` (auxiliaires à l’arrêt) à 0 comme dans la KDD Cup 2022, et filtrer ERA5 incohérent (`Wspd_w` négatif) avant modélisation — voir `sanitize_scada_for_forecasting` et `merge_scada_era5`.
 8. **Tests ciblés** : logique de split, d’horizon et de nettoyage couverte par `pytest` sans dépendre des CSV massifs.
 9. **Artefacts jetables** : rapports `reports/*.csv|md` et `mlruns/` produits localement, non traités comme source de vérité du dépôt.
 

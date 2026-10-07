@@ -117,6 +117,27 @@ def test_train_and_evaluate_pooled_meteo():
     assert "pooled" in res.patv_feature_mode
 
 
+def test_build_modeling_frame_target_is_exactly_h_ahead_despite_gaps():
+    rng = np.random.default_rng(4)
+    n = 1200
+    df = _synthetic_scada_merged(n, rng)
+    df["Patv"] = np.arange(n, dtype=float)  # Patv encodes the step index
+    keep = rng.random(n) > 0.02
+    df = df.loc[keep].reset_index(drop=True)
+    for meteo in (True, False):
+        feat, _ = build_modeling_frame(
+            df,
+            horizon_steps=STEPS_PER_DAY,
+            no_patv_now=meteo,
+            no_patv_lags=meteo,
+            time_meteo_only=meteo,
+        )
+        assert len(feat) > 0
+        assert (feat["y_target"] - feat["Patv"] == STEPS_PER_DAY).all()
+        lead = pd.to_datetime(feat["datetime"]) + pd.Timedelta(days=1)
+        assert lead.isin(pd.to_datetime(df["datetime"])).all()
+
+
 def test_train_and_evaluate_full_scada_path():
     rng = np.random.default_rng(1)
     df = _synthetic_scada_merged(1600, rng)
