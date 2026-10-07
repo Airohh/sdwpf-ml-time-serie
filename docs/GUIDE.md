@@ -1,6 +1,6 @@
 # Guide technique — prévision éolienne & SDWPF
 
-Document de synthèse : objectifs, choix, fichiers, faux pas et états actuels. Les étapes « mineures » (conventions shell, chemins, détails d’API) sont incluses volontairement pour pouvoir tout retrouver plus tard ou en entretien.
+Document de référence : objectifs, choix techniques, fichiers, pièges rencontrés et état actuel. Les détails pratiques (shell, chemins, API) sont gardés pour pouvoir reproduire chaque étape.
 
 **Entrée générale du dépôt :** [`README.md`](../README.md) à la racine. **Cadre métier et pratiques :** [`DOMAINE_ET_PRATIQUES.md`](DOMAINE_ET_PRATIQUES.md).
 
@@ -11,17 +11,17 @@ Document de synthèse : objectifs, choix, fichiers, faux pas et états actuels. 
 | `docs/GUIDE.md` | Ce document |
 | `src/sdwpf/` | Package Python installable (`pip install -e ".[dev]"`) |
 | `scripts/` | Téléchargements données + exploration / benchmark / figures SDWPF |
-| `tests/` | Tests `pytest` |
+| `tests/` | Tests `pytest` (unitaires + smoke tests des scripts sur un faux SDWPF) |
 | `data/` | Données locales (souvent ignorées par Git si lourdes) |
 | `reports/` | Sorties CSV/MD de benchmark ; `reports/figures/` pour les PNG |
-| Racine | `README.md`, `pyproject.toml`, `Dockerfile`, `.env.example` |
+| Racine | `README.md`, `pyproject.toml`, `requirements-lock.txt`, `Dockerfile`, `.env.example` |
 
 ---
 
 ## 1. Point de départ : intention du projet
 
-- **Contexte visé** : préparation type poste **Data Scientist** sur **séries temporelles** et énergie renouvelable (vent / solaire).
-- **Techniques cibles évoquées** : **XGBoost**, forêts aléatoires, rigueur « time series » (splits temporels, pas de fuite de données).
+- **Contexte** : prévision de production d’énergie renouvelable (vent / solaire) sur **séries temporelles**.
+- **Techniques** : **XGBoost**, rigueur « time series » (splits temporels, purge, pas de fuite de données).
 - **Mise en production (piste)** : **Docker**, **AWS SageMaker**, **MLflow**, et à terme une **petite bibliothèque** interne pour standardiser entraînement / évaluation.
 - **Données prévues en parallèle (branches)** :
   - **Chine** : jeu **SDWPF** (SCADA haute fréquence, cible **Patv** — puissance active), priorité pour une démo **co-localisée** (météo + turbine).
@@ -32,10 +32,10 @@ Document de synthèse : objectifs, choix, fichiers, faux pas et états actuels. 
 
 ## 2. Socle Python du dépôt
 
-- **`pyproject.toml`** : paquet installable **`sdwpf`** (dossier **`src/sdwpf/`**), extra **`[dev]`** (**pytest**), extra **`[experiments]`** (**MLflow**). Commandes depuis la racine : **`pip install -e ".[dev]"`** ou avec suivi **`pip install -e ".[dev,experiments]"`**.
+- **`pyproject.toml`** : paquet installable **`sdwpf`** (dossier **`src/sdwpf/`**), extra **`[dev]`** (**pytest**, **ruff**), extra **`[experiments]`** (**MLflow**). Commandes depuis la racine : **`pip install -e ".[dev]"`** ou avec suivi **`pip install -e ".[dev,experiments]"`**. Versions exactes validées : **`pip install -c requirements-lock.txt -e ".[dev]"`**.
 - **`README.md`** (racine) : entrée courte + liens vers ce guide.
 - **Dépendances** : **`numpy`**, **`scikit-learn`**, **`xgboost`**, **`matplotlib`** ; **MLflow** uniquement si l’extra **`experiments`** est installée.
-- **Tests** : **`tests/test_sdwpf_features.py`** (`pytest -q`), sans gros CSV.
+- **Tests** : **`pytest -q`** depuis la racine, sans gros CSV : `test_sdwpf_data.py` (chargement, nettoyage), `test_sdwpf_features.py` (alignement temporel, splits, purge), `test_sdwpf_pipeline.py` (modèle, baselines), `test_cli_smoke.py` (chaque script sur un faux SDWPF). Lint : **`ruff check .`** (aussi en CI).
 - **Pratique** : environnement virtuel (`.venv` / `venv`) recommandé ; **`.gitignore`** exclut aussi **`*.egg-info/`**, **`dist/`**.
 
 ---
@@ -138,7 +138,10 @@ Document de synthèse : objectifs, choix, fichiers, faux pas et états actuels. 
 | **`patv_lag*k*** | **`Patv`** à *t* − *k* pas (historique de puissance). |
 | **`wspd_lag*k*** | **`Wspd`** à *t* − *k* pas (historique de vent mesuré). |
 | **`wdir`**, **`etmp`**, **`itmp`** | Valeurs **à l’instant *t***, sans suffixe « lag ». |
-| **`hour_sin`**, **`hour_cos`**, **`doy_sin`**, **`doy_cos`** | Encodage cyclique de l’heure et du jour dans l’année (uniquement en **`--meteo-mode`**). |
+| **`hour_sin`**, **`hour_cos`** | Encodage cyclique de l’heure **de l’échéance** *t* + *h* (connue à l’avance ; uniquement en **`--meteo-mode`**). |
+| **`doy_sin`**, **`doy_cos`** | Jour de l’année de l’échéance ; **hors modèle par défaut** (**`--day-of-year`** pour l’ajouter) : sur 245 jours, les jours du test n’existent pas dans le train et la variable devient un horodatage déguisé. |
+| **`*_lag*k*`** (ERA5) | Colonne ERA5 à *t* − *k* pas (**`--meteo-max-lag`**, défaut 12). |
+| **`*_at_target`** | Colonne ERA5 lue à l’échéance *t* + *h* (**`--era5-at-target`**) : prévision météo parfaite, borne haute inaccessible en opérationnel. |
 
 **Champs météo « ERA5 » (fichier `sdwpf_weather_v2`, réanalyse sur grille)**
 
@@ -169,21 +172,22 @@ Les libellés **français** sur le graphique d’importances (`sdwpf_visualize.p
 
 Code réutilisable (ajout de **`src/`** au `PYTHONPATH` par les scripts ; le **`Dockerfile`** copie **`src/`**).
 
-- **`constants.py`** : ancre **`2020-05-01`**, colonnes ERA5, **`STEPS_PER_HOUR`** (6), **`STEPS_PER_DAY`** (144).
+- **`constants.py`** : ancre **`2020-05-01`**, colonnes ERA5, **`STEP_MINUTES`** (10), **`STEPS_PER_HOUR`** (6), **`STEPS_PER_DAY`** (144).
 - **`paths.py`** : racine du dépôt, chemins par défaut SCADA / météo.
-- **`data.py`** : chargement chunké turbine, ERA5, merge ; **nettoyage** : `sanitize_scada_for_forecasting` retire `inf`, vent **négatif**, `Wdir` hors **`[-180, 180]`** si renseignée, et ramène `Patv` **négatif** à **0** (convention KDD Cup 2022) ; ERA5 : exclut `Wspd_w` **négatif** ; fusion : `inf` traités comme manquants puis lignes ERA5 incomplètes exclues.
-- **`features.py`** : lags, cible **`y_target`** (calculés sur **`datetime`** : un instant manquant donne NaN, pas la ligne suivante), splits temporels **`temporal_split`** / **`temporal_split_train_val_test`**, **`walk_forward_indices`** (walk-forward expansif : listes d’indices train/test contigus), **`resolve_horizon_steps`**.
-- **`pipeline.py`** : **`train_and_evaluate`** → **`SdwpfRunResult`** (MAE/RMSE **naive**, **persistance** si `patv_now` ∈ features, XGBoost val/test) ; **`load_frame_for_run`** ; **`maybe_log_mlflow`**.
+- **`data.py`** : chargement chunké (**`load_turbines`** / **`load_era5_for_turbines`** : une seule lecture du CSV pour plusieurs turbines), merge ERA5 ; **nettoyage** : `sanitize_scada_for_forecasting` retire `inf`, vent **négatif**, `Wdir` hors **`[-180, 180]`** si renseignée, et ramène `Patv` **négatif** à **0** (convention KDD Cup 2022) ; ERA5 : exclut `Wspd_w` **négatif** ; fusion : `inf` traités comme manquants puis lignes ERA5 incomplètes exclues.
+- **`features.py`** : lags, cible **`y_target`** (calculés sur **`datetime`** : un instant manquant donne NaN, pas la ligne suivante), calendrier de l’échéance, ERA5 à *t* + *h* en option, splits temporels **`temporal_split`** / **`temporal_split_train_val_test`**, **`purge_target_overlap`** (retire les lignes dont la cible *t* + *h* tombe dans le bloc suivant), **`walk_forward_indices`** (walk-forward expansif : listes d’indices train/test contigus), **`resolve_horizon_steps`**.
+- **`pipeline.py`** : **`train_and_evaluate`** / **`train_and_evaluate_pooled`** → **`SdwpfRunResult`** (MAE/RMSE **naive**, **climatologie horaire**, **courbe de puissance** si ERA5 à l’échéance, **persistance** si `patv_now` ∈ features, XGBoost val/test, **`n_purged`**) ; **`load_frames_for_run`** ; **`maybe_log_mlflow`**.
+- **`xgb_device.py`** : device XGBoost (**`cpu`** par défaut, `auto`, `cuda`, `cuda:N`), entraînement et prédiction sur ce device.
 
 ### Script **`scripts/sdwpf_explore.py`**
 - **Rôle** :
-  - **Charger une seule turbine** (`TurbID`, défaut **1**) en **parcourant le CSV par chunks** (fichier très grand, millions de lignes au total pour toutes les machines).
-  - Construire **`datetime`** à partir de **`Day`** + **`Tmstamp`** avec **ancre calendaire `2020-05-01`** (alignée sur **`sdwpf_weather_v2`**, où `Tmstamp` est une date/heure absolue commençant le **2020-05-01**). Trier, **dédoublonner**, convertir les colonnes numériques, **retirer les lignes** sans **`Patv`** ou **`Wspd`**.
+  - **Charger une turbine** (`TurbID`, défaut **1**), ou plusieurs avec **`--pooled 1-20`** (un seul modèle, colonne `turb_id`), en **parcourant le CSV par chunks** (fichier très grand, millions de lignes au total pour toutes les machines).
+  - Construire **`datetime`** à partir de **`Day`** + **`Tmstamp`** avec **ancre calendaire `2020-05-01`** (alignée sur **`sdwpf_weather_v2`**, où `Tmstamp` est une date/heure absolue commençant le **2020-05-01**). Trier, **dédoublonner**, convertir les colonnes numériques, **retirer les lignes** sans **`Patv`** ou **`Wspd`**, ramener **`Patv` < 0** à 0. Les lags et la cible sont lus **sur le temps** (*t* ± *k* × 10 min) : un instant manquant donne NaN, jamais la ligne suivante.
   - Construire des **features** : lags de **`Patv`** et **`Wspd`** (ex. 6 pas = 1 h à pas 10 min), + **`wdir`**, **`etmp`**, **`itmp`**.
-  - **Horizon minimal** : **`train_and_evaluate`** impose **`horizon_steps` ≥ **144** (1 jour à pas 10 min). Si aucun `--horizon` / `--horizon-hours` / `--horizon-days` n’est passé aux scripts, l’horizon par défaut est **144 pas**. **`--horizon`** (pas), ou **`--horizon-hours`** / **`--horizon-days`** (1 h = 6 pas, 1 j = 144 pas). **`--meteo-mode`** : raccourci **`--era5 --no-patv-now --no-patv-lags`**, et le modèle ne voit plus que **calendrier (sin/cos heure + jour d’année) + colonnes ERA5** — **aucun** signal SCADA (**`Wspd`**, **`Wdir`**, **`Etmp`**, **`Itmp`**, ni leurs lags). Pour un scénario intermédiaire « vent / capteurs site + ERA5 mais sans **`Patv`** dans les X », utiliser **`--era5 --no-patv-now --no-patv-lags`** **sans** **`--meteo-mode`** (lags **`Wspd`**, **`wdir`**, **`etmp`**, **`itmp`**, ERA5).
-  - **XGBoost** sur la même cible **`y_target` = `Patv(t+h)`** avec split **temporel**. Par défaut : **train** puis **test** (ex. 70 % / 30 % via `--train-frac`). Option **`--val-frac`** : découpage **train | validation | test** dans l’ordre chronologique (**train_frac + val_frac inférieurs à 1** en cumul) ; la validation sert à l’**early stopping** XGBoost (et les métriques **val** sont affichées), le **test** reste la seule partie jamais vue à l’entraînement pour le **score final**. **Baseline naive** : moyenne des **`y_target`** sur le **train**, évaluée sur le **test**. **Baseline persistance** (prédire **`Patv(t)`** pour la cible **`Patv(t+h)`**) : affichée **uniquement** lorsque **`patv_now`** fait partie des features — sinon la comparaison serait biaisée (ex. **`--meteo-mode`** sans `Patv`). Le benchmark rapporte aussi **`gain_vs_persistence_mae_pct`** quand la persistance est définie. **Walk-forward** : **`walk_forward_indices`** + script **`scripts/sdwpf_walkforward.py`** (résume **moyenne / écart-type** des MAE test sur plusieurs plis). En interne : **`build_modeling_frame`**, **`evaluate_on_indices`** (indices train/val/test explicites) depuis **`sdwpf.pipeline`**.
+  - **Horizon** : **144** pas (1 jour) par défaut, tout horizon ≥ 1 pas est accepté. Si aucun `--horizon` / `--horizon-hours` / `--horizon-days` n’est passé aux scripts, l’horizon par défaut est **144 pas**. **`--horizon`** (pas), ou **`--horizon-hours`** / **`--horizon-days`** (1 h = 6 pas, 1 j = 144 pas). **`--meteo-mode`** : raccourci **`--era5 --no-patv-now --no-patv-lags`**, et le modèle ne voit plus que **calendrier de l’échéance (sin/cos de l’heure) + colonnes ERA5 à *t* et leurs lags** — **aucun** signal SCADA (**`Wspd`**, **`Wdir`**, **`Etmp`**, **`Itmp`**, ni leurs lags). Pour un scénario intermédiaire « vent / capteurs site + ERA5 mais sans **`Patv`** dans les X », utiliser **`--era5 --no-patv-now --no-patv-lags`** **sans** **`--meteo-mode`** (lags **`Wspd`**, **`wdir`**, **`etmp`**, **`itmp`**, ERA5).
+  - **XGBoost** sur la même cible **`y_target` = `Patv(t+h)`** avec split **temporel**. Par défaut : **train** puis **test** (ex. 70 % / 30 % via `--train-frac`). Option **`--val-frac`** : découpage **train | validation | test** dans l’ordre chronologique (**train_frac + val_frac inférieurs à 1** en cumul) ; la validation sert à l’**early stopping** XGBoost (et les métriques **val** sont affichées), le **test** reste la seule partie jamais vue à l’entraînement pour le **score final**. **Purge** : les dernières lignes du train (et de la validation) dont la cible *t* + *h* tombe dans le bloc suivant sont retirées (**`n_purged`**). **Baseline naive** : moyenne des **`y_target`** sur le **train**, évaluée sur le **test**. **Climatologie horaire** : moyenne train de la cible par heure de l’échéance. **Courbe de puissance** (avec **`--era5-at-target`**) : moyenne train par classe de 0,5 m/s de `Wspd_w` à l’échéance. **Baseline persistance** (prédire **`Patv(t)`** pour la cible **`Patv(t+h)`**) : affichée **uniquement** lorsque **`patv_now`** fait partie des features — sinon la comparaison serait biaisée (ex. **`--meteo-mode`** sans `Patv`). Le benchmark rapporte aussi **`gain_vs_persistence_mae_pct`** quand la persistance est définie. **Walk-forward** : **`walk_forward_indices`** + script **`scripts/sdwpf_walkforward.py`** (résume **moyenne / écart-type** des MAE test sur plusieurs plis). En interne : **`build_modeling_frame`**, **`evaluate_on_indices`** (indices train/val/test explicites) depuis **`sdwpf.pipeline`**.
 - **Détail méthodo** : avec **`patv_now`** (= `Patv(t)`), le modèle connaît l’instantané de la production. **`--no-patv-now`** retire `patv_now`. **`--no-patv-lags`** retire tous les **`patv_lag*`** — sauf **`--meteo-mode`**, où il ne reste **ni** historique **ni** mesures SCADA vent/temp, seulement **temps + ERA5**.
-- **Benchmark multi-horizons** : les pas par défaut sont **144, 288, 432, 864** (1 j à 6 j) ; tout pas strictement inférieur à **144** est refusé.
+- **Benchmark multi-horizons** : les pas par défaut sont **144, 288, 432, 864** (1 j à 6 j) ; tout pas ≥ 1 est accepté (ex. **36** = 6 h).
 - **Fusion ERA5 (phase 2)** : avec le flag **`--era5`**, le script charge le CSV **`wtb2005_2104_full_new.csv`** (sous `sdwpf_weather_v2/sdwpf_weather/`, sinon chemin via **`--weather-csv`**), filtre la même **`TurbID`**, et fait une **jointure interne** sur **`datetime`** avec les colonnes reanalysis **`T2m`**, **`Sp`**, **`RelH`**, **`Wspd_w`**, **`Wdir_w`**, **`Tp`**. Ces colonnes sont ajoutées aux features XGBoost. Sur un pas de 10 min avec **`patv_now`**, l’apport peut être **faible voire nuisible** (colinéarité, bruit) ; l’intérêt pédagogique est surtout le **pipeline aligné** et les importances (**`Wspd_w`**, **`Wdir_w`**, etc.).
 
 **Commande typique** (à lancer depuis la racine du projet) :
@@ -198,7 +202,7 @@ Avec reanalysis :
 python scripts/sdwpf_explore.py --era5
 ```
 
-Options utiles : `--turb-id`, `--csv`, `--train-frac`, **`--val-frac`**, **`--early-stopping-rounds`**, `--chunksize`, `--era5`, `--weather-csv`, **`--horizon`**, **`--horizon-hours`**, **`--horizon-days`**, **`--meteo-mode`**, **`--no-patv-now`**, **`--no-patv-lags`**.
+Options utiles : `--turb-id`, **`--pooled`**, `--csv`, `--train-frac`, **`--val-frac`**, **`--early-stopping-rounds`**, `--chunksize`, `--era5`, `--weather-csv`, **`--horizon`**, **`--horizon-hours`**, **`--horizon-days`**, **`--meteo-mode`**, **`--no-patv-now`**, **`--no-patv-lags`**, **`--day-of-year`**, **`--era5-at-target`**, **`--xgb-objective`** (ex. `reg:absoluteerror` pour optimiser directement la MAE), **`--xgb-device`**. Les mêmes options de modèle existent sur le benchmark, le walk-forward et les figures.
 
 Sans **`Patv`** dans les features en **`--meteo-mode`** (temps calendaire + ERA5 seulement) :
 
@@ -212,9 +216,16 @@ Exemple **24 h** en mode météo :
 python scripts/sdwpf_explore.py --meteo-mode --horizon-hours 24
 ```
 
+Borne haute « météo parfaite à l’échéance » et modèle commun à 20 turbines :
+
+```text
+python scripts/sdwpf_explore.py --meteo-mode --era5-at-target
+python scripts/sdwpf_explore.py --meteo-mode --pooled 1-20
+```
+
 ### Benchmark multi-horizons **`scripts/sdwpf_benchmark.py`**
 
-Enchaîne plusieurs horizons (défaut : **1 j → 6 j** en pas : **`144,288,432,864`** ; minimum **144**), écrit **`reports/sdwpf_benchmark_*.csv`** et **`.md`** (dossier **`reports/`** ; fichiers générés souvent ignorés par Git).
+Enchaîne plusieurs horizons (défaut : **1 j → 6 j** en pas : **`144,288,432,864`**), écrit **`reports/sdwpf_benchmark_*.csv`** et **`.md`** (dossier **`reports/`** ; fichiers générés souvent ignorés par Git).
 
 ```text
 python scripts/sdwpf_benchmark.py --meteo-mode
@@ -227,13 +238,18 @@ python scripts/sdwpf_benchmark.py --meteo-mode
   - nuage **Wspd vs Patv** ;
   - sur le **jeu test** : cible **Patv(t+h)** vs **XGBoost** ;
   - barres des **importances** (top 10) ;
-  - figure **`05_kpi_performance_*.png`** : tableau des **MAE / RMSE** (lignes de base, XGB val/test), **gains en %**, barres **MAE** comparatives et encadré de lecture rapide.
-- Options : **`--horizon-hours`**, **`--horizon-days`**, **`--meteo-mode`**, **`--meteo-max-lag`** (retards 1..k sur chaque colonne **ERA5** ; défaut **12** ; **0** = pas de lags mais **Wspd_w³** et **sin/cos** direction), **`--xgb-device`** (`auto`, `cpu`, `cuda`, **`cuda:N`** ; [GPU](https://xgboost.readthedocs.io/en/stable/gpu/index.html), [installation](https://xgboost.readthedocs.io/en/stable/install.html) : wheel **`xgboost`** = GPU possible sur Win/Linux, **`xgboost-cpu`** = CPU seul), **`--series-points`**, **`--test-plot-points`**, **`--out-dir`**, **`--no-kpi-dashboard`** (désactive la figure 05). L’API **`train_and_evaluate`** accepte aussi des horizons **&lt; 1 jour** en pas (ex. **36** = 6 h). Variable d’environnement **`SDWPF_XGB_DEVICE`** si le flag est omis.
+  - figure **`05_kpi_performance_*.png`** : tableau des **MAE / RMSE** (naive, climatologie, courbe de puissance, persistance, XGB val/test), **gains en %**, barres **MAE** comparatives et encadré de lecture rapide ;
+  - figure **`06_tableau_metriques_*.png`** : métriques par turbine (une ligne par turbine à partir de 18).
+- Les CSV SCADA et météo sont lus **une seule fois** pour toutes les turbines demandées.
+- Options : **`--horizon-hours`**, **`--horizon-days`**, **`--meteo-mode`**, **`--meteo-max-lag`** (retards 1..k sur chaque colonne **ERA5** ; défaut **12** ; **0** = pas de lags mais **Wspd_w³** et **sin/cos** direction), **`--xgb-device`** (**`cpu`** par défaut, `auto`, `cuda`, **`cuda:N`** ; CPU et GPU ne construisent pas exactement les mêmes arbres ; [GPU](https://xgboost.readthedocs.io/en/stable/gpu/index.html), [installation](https://xgboost.readthedocs.io/en/stable/install.html) : wheel **`xgboost`** = GPU possible sur Win/Linux, **`xgboost-cpu`** = CPU seul), **`--series-points`**, **`--test-plot-points`**, **`--out-dir`**, **`--no-kpi-dashboard`** (désactive la figure 05). L’API **`train_and_evaluate`** accepte aussi des horizons **&lt; 1 jour** en pas (ex. **36** = 6 h). Variable d’environnement **`SDWPF_XGB_DEVICE`** si le flag est omis.
 
 ```text
 python scripts/sdwpf_visualize.py --meteo-mode --horizon-days 1
 python scripts/sdwpf_visualize.py --meteo-mode --horizon-days 1 --turb-ids 1,2,3,5,8
+python scripts/reproduce_meteo_figures.py --preset all   # figures du README
 ```
+
+Les presets de **`reproduce_meteo_figures.py`** utilisent train 55 % | validation 15 % (early stopping) | test 30 %. Les fichiers prennent le suffixe **`_oracle`** avec **`--era5-at-target`** et **`_doy`** avec **`--day-of-year`**.
 
 Plusieurs **TurbID** : **moyenne** (et écart-type) des séries par instant, **moyenne** des prédictions sur le test par **datetime** (longueurs de test différentes gérées), **importances** XGBoost **moyennées** sur les turbines ; tableau **MAE** par turbine en fin de run.
 
@@ -252,7 +268,7 @@ python scripts/sdwpf_explore.py --mlflow --mlflow-run-name baseline_h1
 
 ### Docker
 
-- Fichier **`Dockerfile`** à la racine : image **Python 3.11 slim**, installation **`pip install .`** depuis **`pyproject.toml`**, copie **`src/`** et **`scripts/`**. Données montées en volume (**`-v …:/app/data`**). Commande par défaut : **`--help`**. Pour **MLflow** dans l’image, ajouter **`experiments`** dans la ligne `pip install` du Dockerfile.
+- Fichier **`Dockerfile`** à la racine : image **Python 3.12 slim** (comme la CI), installation **`pip install -c requirements-lock.txt .`**, copie **`src/`** et **`scripts/`**, exécution en utilisateur non root. Données montées en volume (**`-v …:/app/data`**). Commande par défaut : **`--help`**. Pour **MLflow** dans l’image, ajouter **`experiments`** dans la ligne `pip install` du Dockerfile.
 
 ---
 
@@ -286,9 +302,9 @@ Les scripts ont été **alignés** sur cette arborescence pour éviter des chemi
 
 ## 13. Suite logique du projet (à faire / à prolonger)
 
-- **Fait** : package **`src/sdwpf`** ; **`--horizon-hours` / `--horizon-days` / `--meteo-mode`** ; **`sdwpf_benchmark.py`** ; MLflow ; Docker.
-- **À creuser** : prévisions météo **à l’échéance** (lead time) pour horizons **très longs** ; autres modèles / quantiles ; **SageMaker** si cible AWS.
+- **Fait** : package **`src/sdwpf`** ; **`--horizon-hours` / `--horizon-days` / `--meteo-mode`** ; **`sdwpf_benchmark.py`** ; MLflow ; Docker ; alignement temporel des lags et de la cible ; purge ; baselines climatologie / courbe de puissance ; borne haute ERA5 à l’échéance ; modèle multi-turbines ; smoke tests CI.
+- **À creuser** : vraies prévisions météo **à l’échéance** (NWP) à la place de la borne haute ERA5 ; prévisions en quantiles ; **SageMaker** si cible AWS.
 
 ---
 
-*Dernière mise à jour : réorganisation `docs/` + `scripts/`, train/val/test, benchmark multi-horizons ≥ 1 j.*
+*Dernière mise à jour : alignement temporel de la cible, nettoyage SDWPF (Patv < 0, Wdir), purge, nouvelles baselines, borne haute ERA5 à l’échéance, modèle multi-turbines.*
