@@ -39,14 +39,18 @@ from sdwpf import (
     train_and_evaluate,
 )
 from sdwpf.cli_common import (
+    add_model_arguments,
     add_xgb_device_argument,
     apply_meteo_mode_explore_style,
+    parse_turb_ids,
     resolve_horizon_steps_or_exit,
     resolve_xgb_device_or_exit,
     validate_meteo_max_lag,
+    validate_model_arguments,
     validate_temporal_fractions,
+    xgb_params_from_args,
 )
-from sdwpf.constants import DEFAULT_METEO_MAX_LAG
+from sdwpf.constants import DEFAULT_METEO_MAX_LAG, ERA5_AT_TARGET_SUFFIX
 from sdwpf.kpi_format import (
     extend_float_row_avg,
     extend_skill_row,
@@ -58,16 +62,9 @@ from sdwpf.kpi_format import (
 from sdwpf.pipeline import SdwpfRunResult
 
 
-def _parse_turb_ids(spec: str, fallback: int) -> list[int]:
-    if not spec or not spec.strip():
-        return [fallback]
-    out = [int(x.strip()) for x in spec.split(",") if x.strip()]
-    if not out:
-        return [fallback]
-    return out
-
-
-def _file_tag(turb_ids: list[int], horizon_steps: int, meteo: bool) -> str:
+def _file_tag(
+    turb_ids: list[int], horizon_steps: int, meteo: bool, *, oracle: bool, doy: bool
+) -> str:
     if len(turb_ids) == 1:
         t = f"t{turb_ids[0]}"
     elif len(turb_ids) <= 5:
@@ -77,6 +74,10 @@ def _file_tag(turb_ids: list[int], horizon_steps: int, meteo: bool) -> str:
     t += f"_h{horizon_steps}"
     if meteo:
         t += "_meteo"
+    if oracle:
+        t += "_oracle"
+    if doy:
+        t += "_doy"
     return t
 
 
@@ -103,6 +104,9 @@ def _feature_label_fr(name: str) -> str:
     }
     if name in exact:
         return exact[name]
+    if name.endswith(ERA5_AT_TARGET_SUFFIX):
+        base = name[: -len(ERA5_AT_TARGET_SUFFIX)]
+        return f"{exact.get(base, base)}, à l’échéance t+h"
     m = re.match(r"^([A-Za-z0-9_]+)_lag(\d+)$", name)
     if m:
         base, k = m.group(1), int(m.group(2))
@@ -166,6 +170,7 @@ def _export_performance_metrics_table_figure(
             "MAE XGB",
             "RMSE XGB",
             "MAE naïf",
+            "MAE clim.",
             "nMAE\n%Pmax",
             "nMAE\n%μPatv",
             "Skill",
@@ -183,6 +188,7 @@ def _export_performance_metrics_table_figure(
                     fmt_float(r.xgboost_test_mae, 1),
                     fmt_float(r.xgboost_test_rmse, 1),
                     fmt_float(naive_mae[i], 1),
+                    fmt_float(r.climatology_test_mae, 1),
                     fmt_float(r.xgboost_test_nmae_vs_pmax_pct, 1),
                     fmt_float(r.xgboost_test_nmae_vs_mean_patv_pct, 1),
                     sk_s,
@@ -203,6 +209,7 @@ def _export_performance_metrics_table_figure(
                 fmt_float(_avg(xgb_mae), 1),
                 fmt_float(_avg([r.xgboost_test_rmse for r in results]), 1),
                 fmt_float(mn, 1),
+                fmt_float(_avg([r.climatology_test_mae for r in results]), 1),
                 fmt_float(_avg([r.xgboost_test_nmae_vs_pmax_pct for r in results]), 1),
                 fmt_float(_avg([r.xgboost_test_nmae_vs_mean_patv_pct for r in results]), 1),
                 f"{float(np.mean(sks)):.3f}" if sks else "—",
@@ -210,7 +217,7 @@ def _export_performance_metrics_table_figure(
                 fmt_float(_avg([r.xgboost_test_bias for r in results]), 1),
             ]
         )
-        skill_col_idx = 6
+        skill_col_idx = 7
         dpi = 200
         n_data_rows = len(rows_cell)
         fig_h = min(48.0, max(10.0, 2.2 + n_data_rows * 0.22))
@@ -317,6 +324,14 @@ def _export_performance_metrics_table_figure(
     add_row("RMSE XGBoost (test)", _row_from_optional([r.xgboost_test_rmse for r in results], 2))
     add_row("MAE baseline — moy. cible train (test)", _row_from_optional(naive_mae, 2))
     add_row("RMSE baseline — moy. cible train (test)", _row_from_optional([r.naive_mean_train_test_rmse for r in results], 2))
+
+    add_row(
+        "MAE climatologie horaire (test)",
+        _row_from_optional([r.climatology_test_mae for r in results], 2),
+    )
+    curve_mae = [r.power_curve_test_mae for r in results]
+    if any(x is not None for x in curve_mae):
+        add_row("MAE courbe de puissance ERA5 t+h (test)", _row_from_optional(curve_mae, 2))
 
     has_persist = any(x is not None and np.isfinite(x) for x in persist_mae)
     if has_persist:
@@ -447,6 +462,8 @@ def _export_kpi_performance_figure(
         "Découpage",
         "MAE naive (test)",
         "RMSE naive (test)",
+        "MAE climatologie (test)",
+        "MAE courbe puiss. t+h (test)",
         "MAE persistance (test)",
         "MAE XGB val",
         "MAE XGB test",
@@ -469,15 +486,17 @@ def _export_kpi_performance_figure(
     cells.append([f"{hz_h:.2f}"] * n_col)
     rn = [str(r.n_rows) for r in results]
     if n_t > 1:
-        rn.append(str(int(round(float(np.mean([r.n_rows for r in results]))))))
+        rn.append(str(round(float(np.mean([r.n_rows for r in results])))))
     cells.append(rn)
     nf = [str(r.n_features) for r in results]
     if n_t > 1:
-        nf.append(str(int(round(float(np.mean([r.n_features for r in results]))))))
+        nf.append(str(round(float(np.mean([r.n_features for r in results])))))
     cells.append(nf)
     cells.append([split_txt] * n_col)
     cells.append(extend_float_row(naive_mae_l))
     cells.append(extend_float_row([r.naive_mean_train_test_rmse for r in results]))
+    cells.append(extend_float_row([r.climatology_test_mae for r in results]))
+    cells.append(extend_float_row([r.power_curve_test_mae for r in results]))
     cells.append(extend_float_row(persist_mae_l))
     cells.append(extend_float_row([r.xgboost_val_mae for r in results]))
     cells.append(extend_float_row(xgb_mae_l))
@@ -547,6 +566,8 @@ def _export_kpi_performance_figure(
             [split_txt] * 3,
             triple_stat_row(naive_mae_l),
             triple_stat_row([r.naive_mean_train_test_rmse for r in results]),
+            triple_stat_row([r.climatology_test_mae for r in results]),
+            triple_stat_row([r.power_curve_test_mae for r in results]),
             triple_stat_row(persist_mae_l),
             triple_stat_row([r.xgboost_val_mae for r in results]),
             triple_stat_row(xgb_mae_l),
@@ -564,8 +585,18 @@ def _export_kpi_performance_figure(
             [gain_p_mean, "—", "—"],
         ]
 
-    fig = plt.figure(figsize=(15, 10))
-    gs = GridSpec(2, 2, figure=fig, height_ratios=[1.35, 1.0], width_ratios=[1.55, 1.0], hspace=0.38, wspace=0.28)
+    # Hauteur proportionnelle au nombre de lignes : sinon le titre recouvre l'en-tête du tableau.
+    n_tbl_rows = len(row_labels)
+    fig = plt.figure(figsize=(15, 8.0 + 0.22 * n_tbl_rows))
+    gs = GridSpec(
+        2,
+        2,
+        figure=fig,
+        height_ratios=[max(1.35, 0.085 * n_tbl_rows), 1.0],
+        width_ratios=[1.55, 1.0],
+        hspace=0.3,
+        wspace=0.28,
+    )
     ax_tbl = fig.add_subplot(gs[0, :])
     ax_tbl.axis("off")
     t_compact = (
@@ -610,6 +641,15 @@ def _export_kpi_performance_figure(
     categories = ["Naive\n(moy. train)", "XGBoost\n(test)"]
     heights = [mean_naive, mean_xgb]
     colors = ["#6c757d", "#0d6efd"]
+    for label, vals, color in (
+        ("Courbe puiss.\nERA5 t+h", [r.power_curve_test_mae for r in results], "#20c997"),
+        ("Climatologie\nhoraire", [r.climatology_test_mae for r in results], "#adb5bd"),
+    ):
+        finite = [float(x) for x in vals if x is not None and np.isfinite(x)]
+        if finite:
+            categories.insert(1, label)
+            heights.insert(1, float(np.mean(finite)))
+            colors.insert(1, color)
     if persist_finite:
         categories.insert(1, "Persistance\nPatv(t)")
         heights.insert(1, float(np.mean(persist_finite)))
@@ -695,7 +735,7 @@ def main() -> None:
         "--turb-ids",
         type=str,
         default="",
-        help="Liste séparée par virgules, ex. 1,2,3,5. Si vide, utilise --turb-id.",
+        help="Liste ou plages, ex. 1,2,3,5 ou 1-20. Si vide, utilise --turb-id.",
     )
     p.add_argument("--train-frac", type=float, default=0.7)
     p.add_argument(
@@ -756,6 +796,7 @@ def main() -> None:
         action="store_true",
         help="Ne génère pas les figures 05 et 06 (KPI + tableau métriques)",
     )
+    add_model_arguments(p)
     add_xgb_device_argument(p)
     args = p.parse_args()
     xgb_dev = resolve_xgb_device_or_exit(args.xgb_device)
@@ -765,8 +806,9 @@ def main() -> None:
         validate_meteo_max_lag(args.meteo_max_lag)
 
     validate_temporal_fractions(args.train_frac, args.val_frac)
+    validate_model_arguments(args)
 
-    turb_ids = _parse_turb_ids(args.turb_ids, args.turb_id)
+    turb_ids = parse_turb_ids(args.turb_ids) if args.turb_ids.strip() else [args.turb_id]
     horizon_steps = resolve_horizon_steps_or_exit(
         args.horizon, args.horizon_hours, args.horizon_days
     )
@@ -781,7 +823,13 @@ def main() -> None:
 
     out_dir = args.out_dir or (project_root() / "reports" / "figures")
     out_dir.mkdir(parents=True, exist_ok=True)
-    tag = _file_tag(turb_ids, horizon_steps, args.meteo_mode)
+    tag = _file_tag(
+        turb_ids,
+        horizon_steps,
+        args.meteo_mode,
+        oracle=args.era5_at_target,
+        doy=args.day_of_year,
+    )
 
     multi_label = (
         f"moyenne sur {len(turb_ids)} turbines (n° {', '.join(map(str, turb_ids[:12]))}"
@@ -826,6 +874,9 @@ def main() -> None:
                     no_patv_lags=args.no_patv_lags,
                     time_meteo_only=args.meteo_mode,
                     meteo_max_lag=args.meteo_max_lag,
+                    include_day_of_year=args.day_of_year,
+                    era5_at_target=args.era5_at_target,
+                    xgb_params=xgb_params_from_args(args),
                     early_stopping_rounds=args.early_stopping_rounds,
                     return_test_predictions=True,
                     xgb_device=xgb_dev,
