@@ -58,7 +58,7 @@ def _synthetic_scada_merged(n: int, rng: np.random.Generator) -> pd.DataFrame:
 
 def test_train_and_evaluate_meteo_mode_produces_metrics():
     rng = np.random.default_rng(0)
-    df = _synthetic_scada_merged(900, rng)
+    df = _synthetic_scada_merged(2000, rng)
     res = train_and_evaluate(
         df,
         horizon_steps=STEPS_PER_DAY,
@@ -93,7 +93,7 @@ def test_train_and_evaluate_meteo_mode_produces_metrics():
 
 def test_train_and_evaluate_pooled_meteo():
     rng = np.random.default_rng(3)
-    df1 = _synthetic_scada_merged(600, rng)
+    df1 = _synthetic_scada_merged(2000, rng)
     df2 = df1.copy()
     df2["Patv"] = np.clip(df2["Patv"] * 0.92 + rng.normal(0, 8.0, len(df2)), 0.0, None)
     res = train_and_evaluate_pooled(
@@ -165,6 +165,37 @@ def test_era5_at_target_is_an_upper_bound_when_power_follows_target_weather():
     assert "Wspd_w_at_target" not in base.feature_cols
     assert "doy_sin" not in oracle.feature_cols
     assert oracle.xgboost_test_mae < 0.3 * base.naive_mean_train_test_mae
+    assert base.power_curve_test_mae is None
+    assert oracle.power_curve_test_mae < 0.3 * oracle.naive_mean_train_test_mae
+
+
+def test_purge_removes_train_rows_whose_target_reaches_the_test_block():
+    rng = np.random.default_rng(7)
+    df = _synthetic_scada_merged(1600, rng)
+    kw = dict(horizon_steps=STEPS_PER_DAY, max_lag=4, xgb_device="cpu")
+    res = train_and_evaluate(df, **kw)
+    assert res.n_purged == STEPS_PER_DAY
+    feat, cols = build_modeling_frame(df, horizon_steps=STEPS_PER_DAY, max_lag=4)
+    n_tr = int(len(feat) * 0.7)
+    tr, te = np.arange(n_tr), np.arange(n_tr, len(feat))
+    no_purge = evaluate_on_indices(
+        feat, cols, horizon_steps=STEPS_PER_DAY, patv_feature_mode="", train_idx=tr,
+        val_idx=np.array([], dtype=np.int64), test_idx=te, xgb_device="cpu", purge=False,
+    )
+    assert no_purge.n_purged == 0
+
+
+def test_climatology_baseline_captures_diurnal_cycle():
+    rng = np.random.default_rng(8)
+    df = _synthetic_scada_merged(3000, rng)
+    hour = pd.to_datetime(df["datetime"]).dt.hour.to_numpy()
+    df["Patv"] = 500 + 400 * np.sin(2 * np.pi * hour / 24) + rng.normal(0, 20, len(df))
+    res = train_and_evaluate(
+        df, horizon_steps=STEPS_PER_DAY, no_patv_now=True, no_patv_lags=True,
+        time_meteo_only=True, xgb_device="cpu",
+    )
+    assert res.climatology_test_mae is not None
+    assert res.climatology_test_mae < 0.2 * res.naive_mean_train_test_mae
 
 
 def test_build_modeling_frame_day_of_year_is_opt_in():
@@ -197,7 +228,7 @@ def test_train_and_evaluate_full_scada_path():
 
 def test_train_and_evaluate_matches_evaluate_on_indices():
     rng = np.random.default_rng(42)
-    df = _synthetic_scada_merged(1200, rng)
+    df = _synthetic_scada_merged(2000, rng)
     r1 = train_and_evaluate(
         df,
         horizon_steps=STEPS_PER_DAY,
@@ -246,7 +277,7 @@ def test_train_and_evaluate_matches_evaluate_on_indices():
 
 def test_train_and_evaluate_return_test_predictions():
     rng = np.random.default_rng(2)
-    df = _synthetic_scada_merged(900, rng)
+    df = _synthetic_scada_merged(2000, rng)
     res = train_and_evaluate(
         df,
         horizon_steps=STEPS_PER_DAY,

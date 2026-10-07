@@ -11,13 +11,16 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 from sdwpf.constants import (
     DEFAULT_METEO_MAX_LAG,
+    ERA5_AT_TARGET_SUFFIX,
     POOL_TURB_ID_COL,
+    STEP_MINUTES,
     XGBOOST_RANDOM_STATE,
 )
 from sdwpf.data import load_era5_for_turbine, load_one_turbine, merge_scada_era5
 from sdwpf.features import (
     add_features,
     build_feature_columns,
+    purge_target_overlap,
     temporal_split,
     temporal_split_by_unique_datetime,
     temporal_split_train_val_test,
@@ -55,6 +58,31 @@ def _xgboost_gain_importances(reg: Any, n_features: int) -> np.ndarray:
     return imp
 
 
+def _group_mean_predict(
+    keys_train: np.ndarray, y_train: np.ndarray, keys_all: np.ndarray, fallback: float
+) -> np.ndarray:
+    """Moyenne train de la cible par clé (ex. heure de l'échéance), ``fallback`` si clé inconnue."""
+    means = pd.Series(y_train).groupby(keys_train).mean()
+    return pd.Series(keys_all).map(means).fillna(fallback).to_numpy(dtype=np.float64)
+
+
+def _power_curve_predict(
+    wind_train: np.ndarray,
+    y_train: np.ndarray,
+    wind_all: np.ndarray,
+    fallback: float,
+    bin_width: float = 0.5,
+) -> np.ndarray:
+    """Courbe de puissance empirique : moyenne train par classe de vent, interpolée."""
+    ok = np.isfinite(wind_train)
+    if not ok.any():
+        return np.full(len(wind_all), fallback, dtype=np.float64)
+    curve = pd.Series(y_train[ok]).groupby(np.floor(wind_train[ok] / bin_width)).mean()
+    centers = (curve.index.to_numpy(dtype=np.float64) + 0.5) * bin_width
+    pred = np.interp(wind_all, centers, curve.to_numpy(dtype=np.float64))
+    return np.where(np.isfinite(wind_all), pred, fallback)
+
+
 @dataclass
 class SdwpfRunResult:
     horizon_steps: int
@@ -69,6 +97,14 @@ class SdwpfRunResult:
     # Uniquement si ``patv_now`` est dans les features : prédire Patv(t) pour cible Patv(t+h).
     persistence_test_mae: float | None = None
     persistence_test_rmse: float | None = None
+    # Moyenne train de la cible par heure du jour de l'échéance (cycle diurne).
+    climatology_test_mae: float | None = None
+    climatology_test_rmse: float | None = None
+    # Courbe de puissance empirique (train) sur Wspd_w à l'échéance ; seulement avec ERA5 à t+h.
+    power_curve_test_mae: float | None = None
+    power_curve_test_rmse: float | None = None
+    # Lignes train / val retirées car leur cible t+h tombe dans le bloc suivant.
+    n_purged: int = 0
     xgboost_val_mae: float | None = None
     xgboost_val_rmse: float | None = None
     xgboost_test_mae: float | None = None
@@ -176,8 +212,13 @@ def evaluate_on_indices(
     early_stopping_rounds: int = 30,
     return_test_predictions: bool = False,
     xgb_device: str | None = None,
+    purge: bool = True,
 ) -> SdwpfRunResult:
-    """Évalue XGBoost + baselines sur des indices **déjà** calculés (table ``feat``)."""
+    """Évalue XGBoost + baselines sur des indices **déjà** calculés (table ``feat``).
+
+    ``purge`` retire du train (et de la validation) les lignes dont la cible ``t+h``
+    tombe dans le bloc suivant (voir ``purge_target_overlap``).
+    """
     n = len(feat)
     for name, idx in (
         ("train", train_idx),
@@ -199,6 +240,25 @@ def evaluate_on_indices(
         st_va = set(map(int, val_idx))
         if st_tr & st_va or st_va & st_te:
             raise ValueError("train, val, and test indices must be disjoint")
+
+    n_before = len(train_idx) + len(val_idx)
+    if purge:
+        if "datetime" not in feat.columns:
+            raise ValueError("purge requires a 'datetime' column (or pass purge=False)")
+        dts = feat["datetime"]
+        if len(val_idx):
+            train_idx = purge_target_overlap(dts, train_idx, val_idx, horizon_steps)
+            val_idx = purge_target_overlap(dts, val_idx, test_idx, horizon_steps)
+            if not len(val_idx):
+                raise ValueError(
+                    "validation block is shorter than the horizon: nothing left after purge; "
+                    "increase val_frac or the amount of data"
+                )
+        else:
+            train_idx = purge_target_overlap(dts, train_idx, test_idx, horizon_steps)
+        if not len(train_idx):
+            raise ValueError("train is empty after purging targets that overlap the next block")
+    n_purged = n_before - len(train_idx) - len(val_idx)
 
     X = feat[feature_cols].to_numpy(dtype=np.float64)
     y = feat["y_target"].to_numpy(dtype=np.float64)
@@ -224,6 +284,21 @@ def evaluate_on_indices(
     if "patv_now" in feature_cols:
         pers_pred = feat["patv_now"].to_numpy(dtype=np.float64)
         persistence_mae, persistence_rmse = test_mae_rmse(pers_pred)
+
+    clim_mae = clim_rmse = None
+    if "datetime" in feat.columns:
+        target_hour = (
+            pd.to_datetime(feat["datetime"]) + pd.Timedelta(minutes=horizon_steps * STEP_MINUTES)
+        ).dt.hour.to_numpy()
+        clim_pred = _group_mean_predict(target_hour[train_idx], y_tr, target_hour, y_train_mean)
+        clim_mae, clim_rmse = test_mae_rmse(clim_pred)
+
+    pc_mae = pc_rmse = None
+    pc_col = f"Wspd_w{ERA5_AT_TARGET_SUFFIX}"
+    if pc_col in feat.columns:
+        wind = feat[pc_col].to_numpy(dtype=np.float64)
+        pc_pred = _power_curve_predict(wind[train_idx], y_tr, wind, y_train_mean)
+        pc_mae, pc_rmse = test_mae_rmse(pc_pred)
 
     x_mae = x_rmse = None
     x_val_mae = x_val_rmse = None
@@ -315,6 +390,11 @@ def evaluate_on_indices(
         naive_mean_train_test_rmse=naive_rmse,
         persistence_test_mae=persistence_mae,
         persistence_test_rmse=persistence_rmse,
+        climatology_test_mae=clim_mae,
+        climatology_test_rmse=clim_rmse,
+        power_curve_test_mae=pc_mae,
+        power_curve_test_rmse=pc_rmse,
+        n_purged=n_purged,
         xgboost_val_mae=x_val_mae,
         xgboost_val_rmse=x_val_rmse,
         xgboost_test_mae=x_mae,
@@ -535,16 +615,23 @@ def maybe_log_mlflow(
                 "n_features": result.n_features,
                 "n_rows": result.n_rows,
                 "patv_feature_mode": result.patv_feature_mode,
+                "n_purged": result.n_purged,
             }
         )
         metrics_base: dict[str, float] = {
             "naive_mean_train_test_mae": result.naive_mean_train_test_mae,
             "naive_mean_train_test_rmse": result.naive_mean_train_test_rmse,
         }
-        if result.persistence_test_mae is not None:
-            metrics_base["persistence_test_mae"] = result.persistence_test_mae
-            if result.persistence_test_rmse is not None:
-                metrics_base["persistence_test_rmse"] = result.persistence_test_rmse
+        for k, v in (
+            ("persistence_test_mae", result.persistence_test_mae),
+            ("persistence_test_rmse", result.persistence_test_rmse),
+            ("climatology_test_mae", result.climatology_test_mae),
+            ("climatology_test_rmse", result.climatology_test_rmse),
+            ("power_curve_test_mae", result.power_curve_test_mae),
+            ("power_curve_test_rmse", result.power_curve_test_rmse),
+        ):
+            if v is not None:
+                metrics_base[k] = float(v)
         mlflow.log_metrics(metrics_base)
         if result.xgboost_val_mae is not None:
             vm = {"xgboost_val_mae": result.xgboost_val_mae}

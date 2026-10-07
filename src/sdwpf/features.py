@@ -134,6 +134,25 @@ def temporal_split(
     return idx[:cut], idx[cut:]
 
 
+def purge_target_overlap(
+    datetimes: pd.Series,
+    idx: np.ndarray,
+    next_block_idx: np.ndarray,
+    horizon_steps: int,
+) -> np.ndarray:
+    """Retire de ``idx`` les lignes dont la cible ``t+h`` tombe dans ou après le bloc suivant.
+
+    Sans cette marge, les dernières cibles du train (ou de la validation) appartiennent à
+    la période évaluée ensuite : fuite faible mais réelle, croissante avec l'horizon.
+    """
+    if not len(idx) or not len(next_block_idx):
+        return idx
+    dt = pd.to_datetime(datetimes).to_numpy()
+    block_start = dt[next_block_idx].min()
+    target_time = dt[idx] + np.timedelta64(horizon_steps * STEP_MINUTES, "m")
+    return idx[target_time < block_start]
+
+
 def walk_forward_indices(
     n: int,
     *,

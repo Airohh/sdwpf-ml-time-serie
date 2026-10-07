@@ -8,6 +8,7 @@ from sdwpf.constants import ERA5_EXTRA_COLS, SDWPF_V1_ANCHOR, STEPS_PER_DAY
 from sdwpf.features import (
     add_features,
     build_feature_columns,
+    purge_target_overlap,
     resolve_horizon_steps,
     temporal_split,
     temporal_split_train_val_test,
@@ -57,6 +58,13 @@ def test_walk_forward_indices():
     assert np.array_equal(folds[2][1], np.arange(90, 100))
     assert folds[0][0][0] == 0 and folds[0][0][-1] == 69
     assert folds[2][0][-1] == 89
+
+
+def test_purge_target_overlap_keeps_targets_strictly_before_next_block():
+    dt = pd.Series(pd.date_range(pd.Timestamp(SDWPF_V1_ANCHOR), periods=20, freq="10min"))
+    kept = purge_target_overlap(dt, np.arange(10), np.arange(10, 20), horizon_steps=3)
+    assert np.array_equal(kept, np.arange(7))
+    assert np.array_equal(purge_target_overlap(dt, np.arange(10), np.array([], dtype=int), 3), np.arange(10))
 
 
 def test_walk_forward_indices_errors():
