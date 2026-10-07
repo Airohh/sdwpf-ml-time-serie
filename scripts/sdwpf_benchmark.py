@@ -239,8 +239,10 @@ def main() -> None:
         f"**ERA5:** {era5}  ",
         mode_line.rstrip(),
         "",
-        "| Horizon | Steps | min | Naive MAE | Clim. MAE | Pers. MAE | XGB val MAE | XGB test MAE "
-        "| Gain vs naive % | Gain vs clim. % | Gain vs pers. % | test RMSE |",
+        (
+            "| Horizon | Steps | min | Naive MAE | Clim. MAE | Pers. MAE | XGB val MAE "
+            "| XGB test MAE | Gain vs naive % | Gain vs clim. % | Gain vs pers. % | test RMSE |"
+        ),
         "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for row in rows:

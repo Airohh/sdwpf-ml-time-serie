@@ -161,21 +161,21 @@ def main() -> None:
     )
     print(f"Rows in frame: {sum(len(df) for df in frames.values())}")
 
-    run_kw = dict(
-        horizon_steps=horizon_steps,
-        train_frac=args.train_frac,
-        val_frac=args.val_frac,
-        max_lag=6,
-        no_patv_now=args.no_patv_now,
-        no_patv_lags=args.no_patv_lags,
-        time_meteo_only=args.meteo_mode,
-        meteo_max_lag=args.meteo_max_lag,
-        include_day_of_year=args.day_of_year,
-        era5_at_target=args.era5_at_target,
-        xgb_params=xgb_params_from_args(args),
-        early_stopping_rounds=args.early_stopping_rounds,
-        xgb_device=xgb_dev,
-    )
+    run_kw = {
+        "horizon_steps": horizon_steps,
+        "train_frac": args.train_frac,
+        "val_frac": args.val_frac,
+        "max_lag": 6,
+        "no_patv_now": args.no_patv_now,
+        "no_patv_lags": args.no_patv_lags,
+        "time_meteo_only": args.meteo_mode,
+        "meteo_max_lag": args.meteo_max_lag,
+        "include_day_of_year": args.day_of_year,
+        "era5_at_target": args.era5_at_target,
+        "xgb_params": xgb_params_from_args(args),
+        "early_stopping_rounds": args.early_stopping_rounds,
+        "xgb_device": xgb_dev,
+    }
     try:
         if args.pooled:
             result = train_and_evaluate_pooled(

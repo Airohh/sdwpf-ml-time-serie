@@ -152,13 +152,13 @@ def test_era5_at_target_is_an_upper_bound_when_power_follows_target_weather():
     wind = np.clip(8 + np.cumsum(rng.normal(0, 0.3, n)), 0, 25)
     df["Wspd_w"] = wind
     df["Patv"] = np.clip(1500 * ((wind - 3) / 9) ** 3, 0, 1500) * (wind >= 3)
-    kw = dict(
-        horizon_steps=STEPS_PER_DAY,
-        no_patv_now=True,
-        no_patv_lags=True,
-        time_meteo_only=True,
-        xgb_device="cpu",
-    )
+    kw = {
+        "horizon_steps": STEPS_PER_DAY,
+        "no_patv_now": True,
+        "no_patv_lags": True,
+        "time_meteo_only": True,
+        "xgb_device": "cpu",
+    }
     base = train_and_evaluate(df, **kw)
     oracle = train_and_evaluate(df, era5_at_target=True, **kw)
     assert "Wspd_w_at_target" in oracle.feature_cols
@@ -172,7 +172,7 @@ def test_era5_at_target_is_an_upper_bound_when_power_follows_target_weather():
 def test_purge_removes_train_rows_whose_target_reaches_the_test_block():
     rng = np.random.default_rng(7)
     df = _synthetic_scada_merged(1600, rng)
-    kw = dict(horizon_steps=STEPS_PER_DAY, max_lag=4, xgb_device="cpu")
+    kw = {"horizon_steps": STEPS_PER_DAY, "max_lag": 4, "xgb_device": "cpu"}
     res = train_and_evaluate(df, **kw)
     assert res.n_purged == STEPS_PER_DAY
     feat, cols = build_modeling_frame(df, horizon_steps=STEPS_PER_DAY, max_lag=4)
@@ -201,7 +201,7 @@ def test_climatology_baseline_captures_diurnal_cycle():
 def test_build_modeling_frame_day_of_year_is_opt_in():
     rng = np.random.default_rng(6)
     df = _synthetic_scada_merged(600, rng)
-    kw = dict(horizon_steps=STEPS_PER_DAY, no_patv_now=True, no_patv_lags=True, time_meteo_only=True)
+    kw = {"horizon_steps": STEPS_PER_DAY, "no_patv_now": True, "no_patv_lags": True, "time_meteo_only": True}
     _, cols = build_modeling_frame(df, **kw)
     _, cols_doy = build_modeling_frame(df, include_day_of_year=True, **kw)
     assert "doy_sin" not in cols and "hour_sin" in cols

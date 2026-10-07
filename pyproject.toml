@@ -19,7 +19,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+# ruff épinglé au mineur : son jeu de règles par défaut évolue entre versions.
+dev = ["pytest>=7.0", "ruff>=0.16,<0.17"]
 experiments = ["mlflow>=2.10"]
 
 [tool.setuptools.packages.find]

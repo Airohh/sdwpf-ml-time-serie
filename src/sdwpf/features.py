@@ -216,7 +216,7 @@ def temporal_split_by_unique_datetime(
     n_u = len(u)
     if n_u < 2:
         raise ValueError("need at least 2 unique datetimes for train/test split")
-    cut = int(round(n_u * train_frac))
+    cut = round(n_u * train_frac)
     cut = max(1, min(cut, n_u - 1))
     tr_times = u[:cut]
     te_times = u[cut:]
@@ -240,8 +240,8 @@ def temporal_split_train_val_test_by_unique_datetime(
     dt = pd.to_datetime(datetimes, utc=False)
     u = pd.DatetimeIndex(np.sort(dt.unique()))
     n_u = len(u)
-    cut_tr = int(round(n_u * train_frac))
-    cut_va_end = int(round(n_u * (train_frac + val_frac)))
+    cut_tr = round(n_u * train_frac)
+    cut_va_end = round(n_u * (train_frac + val_frac))
     cut_tr = max(1, cut_tr)
     cut_va_end = max(cut_tr + 1, cut_va_end)
     cut_va_end = min(cut_va_end, n_u - 1)
@@ -336,9 +336,9 @@ def resolve_horizon_steps(
     if horizon_hours is not None or horizon_days is not None:
         steps = 0
         if horizon_hours is not None:
-            steps += int(round(float(horizon_hours) * 6))
+            steps += round(float(horizon_hours) * 6)
         if horizon_days is not None:
-            steps += int(round(float(horizon_days) * STEPS_PER_DAY))
+            steps += round(float(horizon_days) * STEPS_PER_DAY)
         if steps < 1:
             raise ValueError(
                 "horizon from --horizon-hours/--horizon-days must be at least 10 minutes"
